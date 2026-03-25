@@ -1,27 +1,24 @@
+use alloy::primitives::{Address, Signature};
 use axum::{
     extract::State,
+    http::StatusCode,
     response::Json,
     routing::{get, post},
     Router,
 };
-use serde::Serialize;
-use std::sync::Arc;
-use tokio::sync::{Notify, RwLock};
+use serde::{Deserialize, Serialize};
+use std::{collections::HashMap, sync::Arc};
+use tokio::sync::{Mutex, Notify, RwLock};
 
 /// Shared state between the HTTP API and the main keeper loop.
 #[derive(Debug, Default)]
 pub struct KeeperState {
-    /// Unix timestamp of the last completed cycle.
     pub last_cycle_at: Option<u64>,
-    /// Transaction hash of the last successful multicall batch.
     pub last_cycle_tx: Option<String>,
-    /// Per-spoke oracle state, populated after each cycle.
     pub spoke_states: Vec<SpokeState>,
-    /// Update interval in seconds — published so peers can match on it.
     pub update_interval_secs: u64,
 }
 
-/// State for a single spoke oracle as read from Flow EVM.
 #[derive(Debug, Clone)]
 pub struct SpokeState {
     pub name: String,
@@ -31,7 +28,7 @@ pub struct SpokeState {
     pub active: bool,
 }
 
-// ─── JSON response shapes ────────────────────────────────────────────────────
+// ─── JSON shapes ─────────────────────────────────────────────────────────────
 
 #[derive(Serialize)]
 struct HealthResponse {
@@ -57,14 +54,36 @@ struct StatusResponse {
 }
 
 #[derive(Serialize)]
-struct TriggerResponse {
-    status: &'static str,
-    message: &'static str,
+struct ChallengeResponse {
+    /// The exact string the curator must sign with personal_sign (EIP-191)
+    challenge: String,
+    /// Unix timestamp when this challenge expires
+    expires_at: u64,
 }
 
-// ─── Shared state type alias ─────────────────────────────────────────────────
+#[derive(Deserialize)]
+pub struct UpdateRequest {
+    /// The challenge string returned by GET /challenge
+    pub challenge: String,
+    /// EIP-191 personal_sign signature of the challenge (0x-prefixed)
+    pub signature: String,
+}
+
+#[derive(Serialize)]
+struct UpdateResponse {
+    status: &'static str,
+    message: String,
+}
+
+// ─── Shared state type aliases ────────────────────────────────────────────────
 
 pub type SharedState = Arc<RwLock<KeeperState>>;
+
+/// In-memory challenge store: challenge string → expires_at (unix secs)
+pub type ChallengeStore = Arc<Mutex<HashMap<String, u64>>>;
+
+// Challenge TTL in seconds
+const CHALLENGE_TTL_SECS: u64 = 300;
 
 // ─── Handlers ────────────────────────────────────────────────────────────────
 
@@ -73,7 +92,7 @@ async fn health() -> Json<HealthResponse> {
 }
 
 async fn status(
-    State((state, _notify)): State<(SharedState, Arc<Notify>)>,
+    State((state, _notify, _curator, _challenges)): State<(SharedState, Arc<Notify>, Address, ChallengeStore)>,
 ) -> Json<StatusResponse> {
     let now = chrono::Utc::now().timestamp() as u64;
     let locked = state.read().await;
@@ -99,24 +118,119 @@ async fn status(
     })
 }
 
+/// GET /challenge — returns a server-generated one-time challenge for the curator to sign.
+async fn get_challenge(
+    State((_state, _notify, _curator, challenges)): State<(SharedState, Arc<Notify>, Address, ChallengeStore)>,
+) -> Json<ChallengeResponse> {
+    let nonce = uuid::Uuid::new_v4().to_string();
+    let challenge = format!("update:{nonce}");
+    let expires_at = chrono::Utc::now().timestamp() as u64 + CHALLENGE_TTL_SECS;
+
+    // Purge expired challenges while we have the lock
+    let mut store = challenges.lock().await;
+    let now = chrono::Utc::now().timestamp() as u64;
+    store.retain(|_, exp| *exp > now);
+    store.insert(challenge.clone(), expires_at);
+
+    Json(ChallengeResponse { challenge, expires_at })
+}
+
+/// POST /update — curator signs the challenge from GET /challenge and submits it here.
 async fn trigger_update(
-    State((_state, notify)): State<(SharedState, Arc<Notify>)>,
-) -> Json<TriggerResponse> {
+    State((_state, notify, curator, challenges)): State<(SharedState, Arc<Notify>, Address, ChallengeStore)>,
+    Json(body): Json<UpdateRequest>,
+) -> Result<Json<UpdateResponse>, (StatusCode, Json<UpdateResponse>)> {
+    let now = chrono::Utc::now().timestamp() as u64;
+
+    // 1. Look up and consume the challenge (one-time use)
+    {
+        let mut store = challenges.lock().await;
+        match store.remove(&body.challenge) {
+            None => {
+                return Err((
+                    StatusCode::UNAUTHORIZED,
+                    Json(UpdateResponse {
+                        status: "error",
+                        message: "unknown or already-used challenge".into(),
+                    }),
+                ));
+            }
+            Some(expires_at) if now > expires_at => {
+                return Err((
+                    StatusCode::UNAUTHORIZED,
+                    Json(UpdateResponse {
+                        status: "error",
+                        message: "challenge expired".into(),
+                    }),
+                ));
+            }
+            Some(_) => {} // valid
+        }
+    }
+
+    // 2. Parse signature
+    let sig: Signature = body.signature.parse().map_err(|_| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(UpdateResponse {
+                status: "error",
+                message: "invalid signature format".into(),
+            }),
+        )
+    })?;
+
+    // 3. Recover signer via EIP-191 personal_sign hash
+    let recovered = sig.recover_address_from_msg(body.challenge.as_bytes()).map_err(|_| {
+        (
+            StatusCode::UNAUTHORIZED,
+            Json(UpdateResponse {
+                status: "error",
+                message: "could not recover signer from signature".into(),
+            }),
+        )
+    })?;
+
+    // 4. Check recovered address matches curator
+    if recovered != curator {
+        tracing::warn!(
+            recovered = %recovered,
+            curator = %curator,
+            "unauthorized /update attempt"
+        );
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            Json(UpdateResponse {
+                status: "error",
+                message: format!("signer {recovered} is not the vault curator"),
+            }),
+        ));
+    }
+
+    tracing::info!(curator = %curator, "curator-signed update triggered");
     notify.notify_one();
-    Json(TriggerResponse {
+
+    Ok(Json(UpdateResponse {
         status: "triggered",
-        message: "Update cycle triggered, check /status for result",
-    })
+        message: "update cycle triggered".into(),
+    }))
 }
 
 // ─── Server entry point ───────────────────────────────────────────────────────
 
-pub async fn start_server(port: u16, state: SharedState, notify: Arc<Notify>) {
+pub async fn start_server(
+    port: u16,
+    state: SharedState,
+    notify: Arc<Notify>,
+    curator: Address,
+) {
+    let challenges: ChallengeStore = Arc::new(Mutex::new(HashMap::new()));
+
     let app = Router::new()
         .route("/health", get(health))
         .route("/status", get(status))
+        .route("/challenge", get(get_challenge))
         .route("/update", post(trigger_update))
-        .with_state((state, notify));
+        .with_state((state, notify, curator, challenges));
 
     let addr = std::net::SocketAddr::from(([0, 0, 0, 0], port));
     tracing::info!(port, "HTTP API listening");
