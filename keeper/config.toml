@@ -1,0 +1,71 @@
+[hub]
+oracle_registry = "0xA7b968ca75eb0224a396cA5cD482d18D4ca2041a"
+vault_address = "0xaf46A54208CE9924B7577AFf146dfD65eB193861"
+rpc_url = "https://mainnet.evm.nodes.onflow.org"
+chain_id = 747
+
+# Update interval in seconds (3600 = hourly)
+update_interval_secs = 3600
+
+# Staleness threshold in seconds — skip push if oracle was updated less than this ago
+min_update_interval_secs = 1800
+
+batch_updater = "0x88C62602c10D80FE04fc81c3B9368E770F93F650"
+max_retries = 3
+retry_delay_secs = 60
+api_port = 8080
+
+# Peer keeper URLs (optional) — used at startup to find optimal push position
+# Add as many peers as needed
+peers = [
+  # "http://keeper2.example.com:8080",
+]
+
+[[spokes]]
+name = "arbitrum"
+eid = 30110
+chain_id = 42161
+rpc_url = "https://arb1.arbitrum.io/rpc"
+vault_address = "0xaf46A54208CE9924B7577AFf146dfD65eB193861"
+# oracle_address is set at runtime from ORACLE_ARBITRUM env var
+active = true
+
+[[spokes]]
+name = "ethereum"
+eid = 30101
+chain_id = 1
+rpc_url = "https://eth.llamarpc.com"
+vault_address = "0xaf46A54208CE9924B7577AFf146dfD65eB193861"
+active = false
+
+[[spokes]]
+name = "base"
+eid = 30184
+chain_id = 8453
+rpc_url = "https://mainnet.base.org"
+vault_address = "0xaf46A54208CE9924B7577AFf146dfD65eB193861"
+active = false
+
+[[spokes]]
+name = "avalanche"
+eid = 30106
+chain_id = 43114
+rpc_url = "https://api.avax.network/ext/bc/C/rpc"
+vault_address = "0xaf46A54208CE9924B7577AFf146dfD65eB193861"
+active = false
+
+[[spokes]]
+name = "hyperliquid"
+eid = 30367
+chain_id = 999
+rpc_url = "https://rpc.hyperliquid.xyz/evm"
+vault_address = "0xaf46A54208CE9924B7577AFf146dfD65eB193861"
+active = false
+
+[[spokes]]
+name = "plasma"
+eid = 30383
+chain_id = 999
+rpc_url = "https://rpc.plasma.finance"
+vault_address = "0xaf46A54208CE9924B7577AFf146dfD65eB193861"
+active = false

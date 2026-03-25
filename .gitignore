@@ -1,0 +1,12 @@
+# Build artifacts
+out/
+cache/
+broadcast/
+target/
+
+# Secrets
+.env
+**/.env
+
+# Misc
+.DS_Store
