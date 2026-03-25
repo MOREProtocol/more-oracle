@@ -36,7 +36,7 @@ eid = 30101
 chain_id = 1
 rpc_url = "https://eth.llamarpc.com"
 vault_address = "0xaf46A54208CE9924B7577AFf146dfD65eB193861"
-active = false
+active = true
 
 [[spokes]]
 name = "base"
@@ -44,7 +44,7 @@ eid = 30184
 chain_id = 8453
 rpc_url = "https://mainnet.base.org"
 vault_address = "0xaf46A54208CE9924B7577AFf146dfD65eB193861"
-active = false
+active = true
 
 [[spokes]]
 name = "avalanche"
@@ -52,7 +52,7 @@ eid = 30106
 chain_id = 43114
 rpc_url = "https://api.avax.network/ext/bc/C/rpc"
 vault_address = "0xaf46A54208CE9924B7577AFf146dfD65eB193861"
-active = false
+active = true
 
 [[spokes]]
 name = "hyperliquid"
@@ -60,7 +60,7 @@ eid = 30367
 chain_id = 999
 rpc_url = "https://rpc.hyperliquid.xyz/evm"
 vault_address = "0xaf46A54208CE9924B7577AFf146dfD65eB193861"
-active = false
+active = true
 
 [[spokes]]
 name = "plasma"
@@ -68,4 +68,4 @@ eid = 30383
 chain_id = 999
 rpc_url = "https://rpc.plasma.finance"
 vault_address = "0xaf46A54208CE9924B7577AFf146dfD65eB193861"
-active = false
+active = true
