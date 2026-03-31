@@ -4,16 +4,34 @@ vault_address = "0xaf46A54208CE9924B7577AFf146dfD65eB193861"
 rpc_url = "https://mainnet.evm.nodes.onflow.org"
 chain_id = 747
 
-# Update interval in seconds (3600 = hourly)
-update_interval_secs = 3600
+# Scheduled batch push interval (10800 = 3 hours, must be < staleness threshold which is 6h)
+update_interval_secs = 10800
 
 # Staleness threshold in seconds — skip push if oracle was updated less than this ago
 min_update_interval_secs = 1800
+
+# Monitor loop — check spokes for significant changes
+monitor_interval_secs = 60
+
+# Threshold to trigger early push in basis points (0 = disabled)
+# 25 bps = 0.25% — catches harvests and large movements without triggering on gradual yield
+early_push_threshold_bps = 25
+
+# Skip spoke in scheduled batch if it was pushed within this many seconds (0 = never skip)
+skip_if_fresh_secs = 3600
 
 batch_updater = "0x88C62602c10D80FE04fc81c3B9368E770F93F650"
 max_retries = 3
 retry_delay_secs = 60
 api_port = 8080
+
+# Cumulative drift protection (off-chain safety check)
+# Window duration in seconds — the keeper tracks value changes within this period.
+# Set to 0 to disable. Recommended: 86400 (24h) once vault is stable.
+drift_window_secs = 0
+# Maximum cumulative drift from the anchor value in basis points.
+# Set to 0 to disable. Recommended: 1500 (15%) once vault is stable.
+max_cumulative_drift_bps = 0
 
 # Peer keeper URLs (optional) — used at startup to find optimal push position
 # Add as many peers as needed
