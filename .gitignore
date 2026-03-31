@@ -10,3 +10,6 @@ target/
 
 # Misc
 .DS_Store
+
+# Audit
+AUDIT_RESPONSES.md
