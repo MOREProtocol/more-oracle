@@ -34,10 +34,50 @@ pub struct HubConfig {
     /// Peer keeper URLs — used at startup to find optimal push position
     #[serde(default)]
     pub peers: Vec<String>,
+    /// Monitor loop interval in seconds (default 60).
+    /// How often to check spokes for significant totalAssets changes.
+    #[serde(default = "default_monitor_interval_secs")]
+    pub monitor_interval_secs: u64,
+    /// Threshold in basis points to trigger an early push from the monitor loop.
+    /// 25 bps = 0.25%. Set to 0 to disable monitor-driven pushes.
+    #[serde(default = "default_early_push_threshold_bps")]
+    pub early_push_threshold_bps: u64,
+    /// Skip a spoke in the scheduled batch if it was pushed within this many seconds.
+    /// 0 = never skip (always include in batch).
+    #[serde(default = "default_skip_if_fresh_secs")]
+    pub skip_if_fresh_secs: u64,
+    /// Cumulative drift window in seconds (default 86400 = 24h).
+    /// The keeper tracks value changes within this sliding window.
+    #[serde(default = "default_drift_window_secs")]
+    pub drift_window_secs: u64,
+    /// Maximum cumulative drift from the anchor value in basis points
+    /// (default 1500 = 15%). If exceeded, the oracle update is skipped.
+    #[serde(default = "default_max_cumulative_drift_bps")]
+    pub max_cumulative_drift_bps: u64,
 }
 
 fn default_api_port() -> u16 {
     8080
+}
+
+fn default_monitor_interval_secs() -> u64 {
+    60
+}
+
+fn default_early_push_threshold_bps() -> u64 {
+    25
+}
+
+fn default_skip_if_fresh_secs() -> u64 {
+    3600
+}
+
+fn default_drift_window_secs() -> u64 {
+    86400 // 24 hours
+}
+
+fn default_max_cumulative_drift_bps() -> u64 {
+    1500 // 15%
 }
 
 #[derive(Debug, Deserialize, Clone)]
