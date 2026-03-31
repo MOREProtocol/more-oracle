@@ -18,6 +18,9 @@ sol! {
 
     #[allow(missing_docs)]
     function update(uint256 totalAssets) external;
+
+    #[allow(missing_docs)]
+    function curator() external view returns (address);
 }
 
 // OracleBatchUpdater — single tx for all oracle updates
@@ -124,9 +127,61 @@ pub async fn send_batch_update(
     Ok(receipt.transaction_hash)
 }
 
-/// Push a new `totalAssets` value to the oracle on Flow EVM (single-oracle path,
-/// kept for backwards-compatibility / testing).
-#[allow(dead_code)]
+/// Result of an individual oracle update attempt.
+#[derive(Debug)]
+pub struct IndividualUpdateResult {
+    pub oracle: Address,
+    pub success: bool,
+    pub tx_hash: Option<TxHash>,
+    pub error: Option<String>,
+}
+
+/// Send individual `update(totalAssets)` calls to each oracle separately.
+///
+/// This is the fallback path when `batchUpdate()` reverts (e.g. one oracle's
+/// circuit breaker tripped). Each oracle is updated independently so a single
+/// failure does not block the others.
+pub async fn send_individual_updates(
+    flow_rpc: &str,
+    signer: PrivateKeySigner,
+    calls: Vec<(Address, u128)>,
+) -> Vec<IndividualUpdateResult> {
+    let mut results = Vec::with_capacity(calls.len());
+
+    for (oracle_addr, total_assets) in calls {
+        let oracle_str = format!("{oracle_addr:#x}");
+        let total_assets_u256 = U256::from(total_assets);
+
+        // Each call needs its own signer clone (same key, fresh nonce handling)
+        let signer_clone = signer.clone();
+
+        match push_update(&oracle_str, flow_rpc, signer_clone, total_assets_u256).await {
+            Ok(tx_hash) => {
+                results.push(IndividualUpdateResult {
+                    oracle: oracle_addr,
+                    success: true,
+                    tx_hash: Some(tx_hash),
+                    error: None,
+                });
+            }
+            Err(err) => {
+                results.push(IndividualUpdateResult {
+                    oracle: oracle_addr,
+                    success: false,
+                    tx_hash: None,
+                    error: Some(format!("{err:#}")),
+                });
+            }
+        }
+    }
+
+    results
+}
+
+/// Push a new `totalAssets` value to the oracle on Flow EVM (single-oracle path).
+///
+/// Used as the fallback when batchUpdate() reverts, and kept for
+/// backwards-compatibility / testing.
 ///
 /// Uses the keeper wallet as signer. Returns the transaction hash on success.
 pub async fn push_update(
@@ -164,4 +219,25 @@ pub async fn push_update(
         .with_context(|| "Waiting for update() receipt failed")?;
 
     Ok(receipt.transaction_hash)
+}
+
+/// Read the curator() address from the vault contract.
+pub async fn read_curator(vault_address: &str, flow_rpc: &str) -> Result<Address> {
+    let rpc_url = flow_rpc
+        .parse::<reqwest::Url>()
+        .with_context(|| format!("Invalid Flow RPC URL: {flow_rpc}"))?;
+
+    let provider = ProviderBuilder::new().on_http(rpc_url);
+
+    let vault_addr = Address::from_str(vault_address)
+        .with_context(|| format!("Invalid vault address: {vault_address}"))?;
+
+    let call = curatorCall {};
+    let call_builder = alloy::contract::SolCallBuilder::new_sol(&provider, &vault_addr, &call);
+    let result = call_builder
+        .call()
+        .await
+        .with_context(|| "curator() call failed on vault")?;
+
+    Ok(result._0)
 }

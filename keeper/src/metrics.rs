@@ -73,3 +73,14 @@ pub fn log_zero_assets(spoke_name: &str) {
         "totalAssets() returned 0 — pushing 1 to avoid ValueNotPositive revert"
     );
 }
+
+/// Log the result of individual fallback updates.
+#[allow(dead_code)]
+pub fn log_individual_fallback_summary(succeeded: usize, failed: usize) {
+    info!(
+        succeeded,
+        failed,
+        ts = %Utc::now().to_rfc3339(),
+        "individual fallback update summary"
+    );
+}
