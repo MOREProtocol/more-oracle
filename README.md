@@ -71,4 +71,4 @@ cast send 0x88C62602c10D80FE04fc81c3B9368E770F93F650 \
 
 ## Oracle staleness
 
-The vault reverts with `OraclePriceIsOld` if the oracle value is older than **3 hours**. The keeper pushes every hour by default, leaving a 2-hour safety margin.
+The vault reverts with `OraclePriceIsOld` if the oracle value is older than the configured `stalenessThreshold` — recommended **6 hours**. The keeper pushes every hour by default, leaving a 5-hour safety margin. Additionally, the monitor loop pushes immediately on any spoke change > 25 bps.

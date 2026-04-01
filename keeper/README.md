@@ -66,11 +66,12 @@ On startup the new keeper automatically registers with each peer — it sends a 
 | `POST /peers/register` | none | Start peer registration (returns challenge) |
 | `POST /peers/verify` | challenge signature | Complete peer registration (returns api_key) |
 | `POST /peers/notify` | none | Notify of a new peer in the network |
-| `GET /peers/spoke-values` | `X-Keeper-Key` | Get this keeper's latest spoke readings |
+| `GET /peers/spoke-values` | `X-Keeper-Key` | Get this keeper's cached last-cycle spoke readings |
+| `GET /peers/spoke-values/live` | `X-Keeper-Key` | Read spoke values fresh from RPC right now (used for fallback) |
 
 ## Curator operational requirements
 
-- `stalenessThreshold` in `OracleRegistry` must have a buffer above the 3-hour heartbeat — recommended **6 hours**. If the keeper is delayed and the threshold is too tight, hub deposits revert until the oracle is refreshed.
+- `stalenessThreshold` in `OracleRegistry` must have a buffer above the 1-hour heartbeat — recommended **6 hours**. If the keeper is delayed and the threshold is too tight, hub deposits revert until the oracle is refreshed.
 - On bridge: pause the vault → bridge assets → update oracles manually → unpause. Never unpause before updating the oracle.
 - If all oracles go stale and keeper recovery is not immediate, the owner can call `setOraclesCrossChainAccounting(false)` to unblock the vault.
 
