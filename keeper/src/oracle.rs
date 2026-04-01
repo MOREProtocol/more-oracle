@@ -1,7 +1,9 @@
 use alloy::{
+    eips::BlockId,
     network::EthereumWallet,
     primitives::{Address, TxHash, U256},
     providers::ProviderBuilder,
+    rpc::types::BlockNumberOrTag,
     signers::local::PrivateKeySigner,
     sol,
 };
@@ -49,7 +51,8 @@ pub async fn latest_timestamp(
         })?;
 
     let call = latestTimestampCall {};
-    let call_builder = alloy::contract::SolCallBuilder::new_sol(&provider, &oracle_addr, &call);
+    let call_builder = alloy::contract::SolCallBuilder::new_sol(&provider, &oracle_addr, &call)
+        .block(BlockId::Number(BlockNumberOrTag::Finalized));
     let result = call_builder
         .call()
         .await

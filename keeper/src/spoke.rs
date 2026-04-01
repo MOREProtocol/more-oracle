@@ -1,6 +1,8 @@
 use alloy::{
+    eips::BlockId,
     primitives::{Address, U256},
     providers::ProviderBuilder,
+    rpc::types::BlockNumberOrTag,
     sol,
 };
 use eyre::{Context, Result};
@@ -35,9 +37,10 @@ pub async fn read_total_assets(spoke: &SpokeConfig) -> Result<U256> {
         )
     })?;
 
-    // Build call data for totalAssets()
+    // Build call data for totalAssets() — read against finalized block to avoid reorg risk
     let call = totalAssetsCall {};
-    let call_builder = alloy::contract::SolCallBuilder::new_sol(&provider, &vault_addr, &call);
+    let call_builder = alloy::contract::SolCallBuilder::new_sol(&provider, &vault_addr, &call)
+        .block(BlockId::Number(BlockNumberOrTag::Finalized));
     let result = call_builder
         .call()
         .await
