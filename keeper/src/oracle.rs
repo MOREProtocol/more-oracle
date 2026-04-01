@@ -29,6 +29,9 @@ sol! {
 sol! {
     #[allow(missing_docs)]
     function batchUpdate(address[] calldata oracles, uint256[] calldata values) external;
+
+    #[allow(missing_docs)]
+    function isWhitelisted(address keeper) external view returns (bool);
 }
 
 
@@ -222,6 +225,29 @@ pub async fn push_update(
         .with_context(|| "Waiting for update() receipt failed")?;
 
     Ok(receipt.transaction_hash)
+}
+
+/// Check whether `keeper` is whitelisted on the OracleBatchUpdater contract.
+pub async fn is_whitelisted(
+    batch_updater: Address,
+    keeper: Address,
+    flow_rpc: &str,
+) -> Result<bool> {
+    let rpc_url = flow_rpc
+        .parse::<reqwest::Url>()
+        .with_context(|| format!("Invalid Flow RPC URL: {flow_rpc}"))?;
+
+    let provider = ProviderBuilder::new().on_http(rpc_url);
+
+    let call = isWhitelistedCall { keeper };
+    let call_builder =
+        alloy::contract::SolCallBuilder::new_sol(&provider, &batch_updater, &call);
+    let result = call_builder
+        .call()
+        .await
+        .with_context(|| format!("isWhitelisted() call failed for keeper {keeper}"))?;
+
+    Ok(result._0)
 }
 
 /// Read the curator() address from the vault contract.

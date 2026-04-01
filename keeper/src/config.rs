@@ -54,6 +54,10 @@ pub struct HubConfig {
     /// (default 1500 = 15%). If exceeded, the oracle update is skipped.
     #[serde(default = "default_max_cumulative_drift_bps")]
     pub max_cumulative_drift_bps: u64,
+    /// This keeper's own public URL (announced to peers during registration).
+    /// Example: KEEPER_URL=https://keeper1.example.com:8080
+    #[serde(default)]
+    pub keeper_url: Option<String>,
 }
 
 fn default_api_port() -> u16 {

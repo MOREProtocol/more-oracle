@@ -3,11 +3,12 @@ mod config;
 mod drift;
 mod metrics;
 mod oracle;
+mod peer_registry;
 mod peers;
 mod spoke;
 
 use alloy::{primitives::Address, signers::local::PrivateKeySigner};
-use api::{KeeperState, SharedState, SpokeState};
+use api::{KeeperState, SharedState, SpokeReading, SpokeState};
 use drift::DriftTracker;
 use eyre::{Context, Result};
 use std::{
@@ -21,6 +22,7 @@ use tracing::{error, info, warn};
 
 use config::{RuntimeConfig, SpokeConfig};
 use metrics::*;
+use peer_registry::{new_peer_registry, new_pending_registrations, PeerRegistry};
 
 /// Per-spoke tracking of the last value pushed on-chain and when it was pushed.
 /// Shared between the monitor loop and the scheduled loop.
@@ -81,7 +83,7 @@ async fn main() -> Result<()> {
         if spoke.oracle_address.is_none() {
             warn!(
                 spoke = spoke.name,
-                "oracle address not configured — set ORACLE_{} in .env",
+                "oracle address not configured -- set ORACLE_{} in .env",
                 spoke.name.to_uppercase()
             );
         }
@@ -104,6 +106,14 @@ async fn main() -> Result<()> {
         .context("Failed to read curator() from vault")?;
     info!(curator = %curator, "vault curator loaded");
 
+    // Build signer for peer registration
+    let signer = PrivateKeySigner::from_str(&cfg.keeper_private_key)
+        .context("Invalid KEEPER_PRIVATE_KEY")?;
+
+    // Create peer registry and pending registrations
+    let peer_registry: PeerRegistry = new_peer_registry();
+    let pending_registrations = new_pending_registrations();
+
     // Spawn HTTP API server
     let api_port = cfg.hub.api_port;
     tokio::spawn(api::start_server(
@@ -111,6 +121,13 @@ async fn main() -> Result<()> {
         shared_state.clone(),
         notify.clone(),
         curator,
+        peer_registry.clone(),
+        pending_registrations.clone(),
+        cfg.hub.batch_updater,
+        cfg.flow_rpc().to_string(),
+        cfg.hub.keeper_url.clone(),
+        Some(signer.clone()),
+        active_spokes.clone(),
     ));
 
     // Peer-aware startup coordination: find the optimal position in the push schedule
@@ -130,6 +147,9 @@ async fn main() -> Result<()> {
         sleep(startup_sleep).await;
     }
 
+    // Attempt peer registrations after startup sleep
+    peers::attempt_peer_registrations(&cfg, &signer, &peer_registry).await;
+
     // Shared last-pushed state: tracks per-spoke what was last pushed and when.
     let last_pushed: LastPushedState = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
 
@@ -138,6 +158,17 @@ async fn main() -> Result<()> {
         cfg.hub.drift_window_secs,
         cfg.hub.max_cumulative_drift_bps,
     )));
+
+    // Spawn peer sync loop
+    {
+        let sync_cfg = cfg.clone();
+        let sync_registry = peer_registry.clone();
+        let sync_notify = notify.clone();
+        tokio::spawn(async move {
+            peers::run_peer_sync_loop(sync_cfg, sync_registry, sync_notify).await;
+        });
+        info!("peer sync loop spawned");
+    }
 
     // Spawn the monitor loop if early_push_threshold_bps > 0
     if cfg.hub.early_push_threshold_bps > 0 {
@@ -171,6 +202,7 @@ async fn main() -> Result<()> {
         notify,
         drift_tracker,
         last_pushed,
+        peer_registry,
     )
     .await;
 
@@ -219,7 +251,7 @@ async fn run_monitor_loop(
                                 current_value = total_assets,
                                 delta_bps,
                                 threshold_bps,
-                                "monitor: delta exceeds threshold — triggering early push"
+                                "monitor: delta exceeds threshold -- triggering early push"
                             );
                             true
                         } else {
@@ -227,7 +259,7 @@ async fn run_monitor_loop(
                         }
                     }
                     None => {
-                        // No previous push recorded — record current value without pushing.
+                        // No previous push recorded -- record current value without pushing.
                         // The scheduled loop will handle the first push.
                         false
                     }
@@ -311,6 +343,7 @@ async fn run_scheduled_loop(
     notify: Arc<Notify>,
     drift_tracker: Arc<tokio::sync::Mutex<DriftTracker>>,
     last_pushed: LastPushedState,
+    peer_registry: PeerRegistry,
 ) {
     loop {
         log_cycle_start("scheduled");
@@ -320,11 +353,44 @@ async fn run_scheduled_loop(
 
         loop {
             // 1. Read totalAssets() from ALL active spokes IN PARALLEL
-            info!("Reading totalAssets from {} spoke(s)…", spokes.len());
+            info!("Reading totalAssets from {} spoke(s)...", spokes.len());
             let spoke_values = spoke::read_all_spokes(spokes).await;
 
             for (name, val) in &spoke_values {
                 info!(spoke = %name, total_assets = val, "read spoke value");
+            }
+
+            // 1b. Cross-validate and resolve with peer readings
+            let resolved_values =
+                peers::cross_validate_and_resolve(&spoke_values, &peer_registry, cfg).await;
+
+            // 1c. Store readings in shared state for peer sharing
+            {
+                let now_ts = chrono::Utc::now().timestamp() as u64;
+                let readings: Vec<SpokeReading> = resolved_values
+                    .iter()
+                    .map(|(name, value)| {
+                        let source = if spoke_values
+                            .iter()
+                            .any(|(n, v)| n == name && *v == *value && *v > 1)
+                        {
+                            "rpc".to_string()
+                        } else if *value > 1 {
+                            "peer_fallback".to_string()
+                        } else {
+                            "failed".to_string()
+                        };
+                        SpokeReading {
+                            spoke: name.clone(),
+                            value: *value,
+                            source,
+                            at: now_ts,
+                        }
+                    })
+                    .collect();
+
+                let mut state = shared_state.write().await;
+                state.last_spoke_readings = readings;
             }
 
             // 2. Check staleness against the first spoke's oracle (representative)
@@ -335,10 +401,10 @@ async fn run_scheduled_loop(
 
             // 3. Build the calls list, filtering out spokes that are "fresh"
             //    (recently pushed by the monitor loop).
-            let all_calls = match build_oracle_calls(spokes, &spoke_values) {
+            let all_calls = match build_oracle_calls(spokes, &resolved_values) {
                 Some(c) => c,
                 None => {
-                    warn!("No oracle addresses configured for any active spoke — skipping");
+                    warn!("No oracle addresses configured for any active spoke -- skipping");
                     break;
                 }
             };
@@ -357,13 +423,13 @@ async fn run_scheduled_loop(
                 info!(
                     skipped_fresh,
                     remaining = calls_to_push.len(),
-                    "skipped {} spoke(s) — recently pushed by monitor loop",
+                    "skipped {} spoke(s) -- recently pushed by monitor loop",
                     skipped_fresh
                 );
             }
 
             if calls_to_push.is_empty() {
-                info!("All spokes are fresh (recently pushed by monitor) — skipping entire batch");
+                info!("All spokes are fresh (recently pushed by monitor) -- skipping entire batch");
                 break;
             }
 
@@ -398,7 +464,7 @@ async fn run_scheduled_loop(
             }
 
             if calls.is_empty() {
-                warn!("All oracles filtered by drift protection — skipping cycle");
+                warn!("All oracles filtered by drift protection -- skipping cycle");
                 break;
             }
 
@@ -408,7 +474,7 @@ async fn run_scheduled_loop(
             let signer = match PrivateKeySigner::from_str(&cfg.keeper_private_key) {
                 Ok(s) => s,
                 Err(e) => {
-                    error!(error = %e, "Invalid KEEPER_PRIVATE_KEY — cannot send tx");
+                    error!(error = %e, "Invalid KEEPER_PRIVATE_KEY -- cannot send tx");
                     break;
                 }
             };
@@ -440,7 +506,7 @@ async fn run_scheduled_loop(
                         warn!(
                             error = %batch_err,
                             num_oracles = calls.len(),
-                            "batchUpdate reverted — falling back to individual oracle updates"
+                            "batchUpdate reverted -- falling back to individual oracle updates"
                         );
                         // Fall through to individual updates below
                     }
@@ -495,12 +561,12 @@ async fn run_scheduled_loop(
             }
 
             if failed > 0 && succeeded == 0 {
-                // All individual calls also failed — apply retry logic
+                // All individual calls also failed -- apply retry logic
                 attempt += 1;
                 if attempt >= cfg.hub.max_retries {
                     error!(
                         attempts = attempt,
-                        "CRITICAL: all oracle updates failed (batch + individual) after max retries — giving up this cycle"
+                        "CRITICAL: all oracle updates failed (batch + individual) after max retries -- giving up this cycle"
                     );
                     break;
                 } else {
@@ -508,7 +574,7 @@ async fn run_scheduled_loop(
                         attempt,
                         max_retries = cfg.hub.max_retries,
                         retry_delay_secs = cfg.hub.retry_delay_secs,
-                        "all individual updates failed — will retry full cycle"
+                        "all individual updates failed -- will retry full cycle"
                     );
                     sleep(Duration::from_secs(cfg.hub.retry_delay_secs)).await;
                     continue;
@@ -537,7 +603,7 @@ async fn run_scheduled_loop(
         tokio::select! {
             _ = sleep(Duration::from_secs(cfg.hub.update_interval_secs)) => {},
             _ = notify.notified() => {
-                info!("woken early by POST /update — starting cycle immediately");
+                info!("woken early by POST /update -- starting cycle immediately");
             }
         }
     }
@@ -584,7 +650,7 @@ async fn filter_fresh_spokes(
             info!(
                 spoke = spoke_name.unwrap_or("unknown"),
                 oracle = %oracle_addr,
-                "skipping spoke — recently pushed by monitor loop"
+                "skipping spoke -- recently pushed by monitor loop"
             );
             skipped += 1;
         } else {
@@ -741,13 +807,13 @@ async fn check_staleness_and_skip(spokes: &[SpokeConfig], cfg: &RuntimeConfig) -
                 info!(
                     oracle_age_secs = age_secs,
                     min_update_interval_secs = cfg.hub.min_update_interval_secs,
-                    "oracle is fresh — skipping batch"
+                    "oracle is fresh -- skipping batch"
                 );
                 true
             } else {
                 info!(
                     oracle_age_secs = age_secs,
-                    "oracle is stale — proceeding with batch update"
+                    "oracle is stale -- proceeding with batch update"
                 );
                 false
             }
@@ -756,7 +822,7 @@ async fn check_staleness_and_skip(spokes: &[SpokeConfig], cfg: &RuntimeConfig) -
             warn!(
                 error = %err,
                 oracle_address,
-                "failed to read latestTimestamp — proceeding with batch update anyway"
+                "failed to read latestTimestamp -- proceeding with batch update anyway"
             );
             false
         }

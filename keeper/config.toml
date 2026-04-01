@@ -4,8 +4,8 @@ vault_address = "0xaf46A54208CE9924B7577AFf146dfD65eB193861"
 rpc_url = "https://mainnet.evm.nodes.onflow.org"
 chain_id = 747
 
-# Scheduled batch push interval (10800 = 3 hours, must be < staleness threshold which is 6h)
-update_interval_secs = 10800
+# Scheduled batch push interval (3600 = 1 hour, must be < staleness threshold which is 6h)
+update_interval_secs = 3600
 
 # Staleness threshold in seconds — skip push if oracle was updated less than this ago
 min_update_interval_secs = 1800
