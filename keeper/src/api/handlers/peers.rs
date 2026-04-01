@@ -160,6 +160,7 @@ pub async fn peer_verify(
                 registered_at: now,
                 last_seen: Some(now),
                 last_push_at: None,
+                active: true,
             },
         );
     }

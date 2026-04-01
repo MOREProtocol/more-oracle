@@ -1,5 +1,8 @@
 mod handlers;
 
+#[cfg(test)]
+mod tests;
+
 use alloy::primitives::Address;
 use axum::{
     routing::{get, post},

@@ -18,6 +18,8 @@ pub struct PeerInfo {
     pub last_seen: Option<u64>,
     /// Unix timestamp of the peer's last push (from their /status response).
     pub last_push_at: Option<u64>,
+    /// false after 6h without a successful /status poll.
+    pub active: bool,
 }
 
 /// Thread-safe peer registry keyed by peer URL.

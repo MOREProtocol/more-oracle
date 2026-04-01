@@ -54,10 +54,7 @@ pub async fn status(State(app): State<AppState>) -> Json<StatusResponse> {
     let peers_json: Vec<PeerStatusJson> = registry
         .values()
         .map(|p| {
-            let healthy = p
-                .last_seen
-                .map(|ls| now.saturating_sub(ls) < 120)
-                .unwrap_or(false);
+            let healthy = p.active && p.last_seen.map_or(false, |ls| now.saturating_sub(ls) < 120);
             PeerStatusJson {
                 url: p.url.clone(),
                 wallet: format!("{:#x}", p.wallet),

@@ -350,6 +350,7 @@ pub async fn attempt_peer_registrations(
                             registered_at: now,
                             last_seen: None,
                             last_push_at: None,
+                            active: true,
                         },
                     );
                     info!(
@@ -435,6 +436,9 @@ pub async fn cross_validate_and_resolve(
     let mut peer_values: Vec<Vec<SpokeReading>> = Vec::new();
 
     for (_, peer_info) in registry.iter() {
+        if !peer_info.active {
+            continue;
+        }
         let api_key = match &peer_info.outgoing_api_key {
             Some(k) => k.clone(),
             None => continue,
@@ -551,6 +555,8 @@ pub async fn run_peer_sync_loop(
         let peer_urls: Vec<String> = registry.keys().cloned().collect();
         drop(registry);
 
+        const SIX_HOURS_SECS: u64 = 6 * 60 * 60;
+
         for peer_url in &peer_urls {
             let url = format!("{}/status", peer_url.trim_end_matches('/'));
             match client.get(&url).send().await {
@@ -575,7 +581,28 @@ pub async fn run_peer_sync_loop(
             }
         }
 
+        // Inactivity timeout: mark peers inactive if no successful poll for 6h
+        {
+            let mut registry = peer_registry.lock().await;
+            for (url, info) in registry.iter_mut() {
+                let stale = match info.last_seen {
+                    Some(ls) => now.saturating_sub(ls) > SIX_HOURS_SECS,
+                    None => now.saturating_sub(info.registered_at) > SIX_HOURS_SECS,
+                };
+                if stale && info.active {
+                    info.active = false;
+                    warn!(
+                        peer_url = %url,
+                        "peer marked inactive — no response for 6h, will re-register on next startup"
+                    );
+                }
+            }
+            // Evict inactive peers from the registry — they must re-register from scratch
+            registry.retain(|_, v| v.active);
+        }
+
         // Failover detection: if any peer's last_push_at is too old, wake scheduled loop
+        // Only consider active peers
         let registry = peer_registry.lock().await;
         let failover_threshold = cfg.hub.update_interval_secs + 120;
 
