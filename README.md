@@ -69,6 +69,38 @@ cast send 0x88C62602c10D80FE04fc81c3B9368E770F93F650 \
 
 2. Follow the keeper setup in [`keeper/README.md`](keeper/README.md).
 
+## Keeper API
+
+The keeper exposes an HTTP API. All sensitive endpoints require EIP-191 challenge-response authentication — there are no API keys. The wallet must be whitelisted on `OracleBatchUpdater`.
+
+| Method | Path | Auth | Description |
+|---|---|---|---|
+| `GET` | `/health` | none | Liveness probe |
+| `GET` | `/challenge` | none | Issue a one-time challenge (120s TTL) |
+| `GET` | `/peers/challenge` | none | Issue a one-time challenge for peer endpoints |
+| `POST` | `/status` | challenge-response | Full keeper state: spokes, last push, peers |
+| `POST` | `/update` | challenge-response (curator only) | Trigger an immediate update cycle |
+| `POST` | `/peers/register` | challenge-response | Register a peer keeper |
+| `POST` | `/peers/verify` | challenge-response | Backward-compat alias for `/peers/register` |
+| `POST` | `/peers/spoke-values` | challenge-response | Cached spoke readings from last cycle |
+| `POST` | `/peers/spoke-values/live` | challenge-response | Fresh spoke readings from RPC |
+| `POST` | `/peers/notify` | challenge-response | Notify of a new peer in the mesh |
+
+**Auth flow:** `GET /challenge?wallet=0x<address>` → sign the returned `challenge` string with EIP-191 (`personal_sign`) → POST target endpoint with `{ wallet, signature }`. Challenges are single-use and expire after 120 seconds.
+
+## Keeper security
+
+- Unified EIP-191 challenge-response on all sensitive endpoints — no static secrets
+- On-chain whitelist (`OracleBatchUpdater.isWhitelisted`) is the source of truth; cached 5 minutes per wallet
+- SSRF protection: peer URLs are validated before any outbound request — rejects non-http/s schemes, loopback, RFC 1918, link-local, and unique-local addresses (including DNS rebinding via hostname resolution)
+- HTTP security headers on every response: `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`, `Content-Security-Policy: default-src 'none'`, `Cache-Control: no-store`, `Strict-Transport-Security`
+- Request body limit: 64 KiB; request timeout: 30s; concurrency cap: 256
+- Structured audit log on every auth attempt (`auth_ok` / `auth_fail` with wallet, endpoint, timestamp, reason)
+- Off-chain drift circuit breaker: suppresses pushes if cumulative value change exceeds threshold within a sliding window
+- On-chain circuit breaker: `SpokeVaultOracle.maxChangeBps` reverts individual updates that exceed the per-update change limit
+
 ## Oracle staleness
 
-The vault reverts with `OraclePriceIsOld` if the oracle value is older than the configured `stalenessThreshold` — recommended **6 hours**. The keeper pushes every hour by default, leaving a 5-hour safety margin. Additionally, the monitor loop pushes immediately on any spoke change > 25 bps.
+The vault reverts with `OraclePriceIsOld` if the oracle value is older than the configured `stalenessThreshold` — recommended **6 hours**. The keeper pushes every hour by default, leaving a 5-hour safety margin. The monitor loop pushes immediately on any spoke change > 25 bps.
+
+If all oracles go stale and keeper recovery is not immediate, the vault owner can call `setOraclesCrossChainAccounting(false)` to unblock the vault.
