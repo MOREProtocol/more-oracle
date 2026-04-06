@@ -5,6 +5,7 @@ mod metrics;
 mod oracle;
 mod peer_registry;
 mod peers;
+mod security;
 mod spoke;
 
 use alloy::{primitives::Address, signers::local::PrivateKeySigner};
@@ -136,6 +137,7 @@ async fn main() -> Result<()> {
         &cfg.hub.peers,
         cfg.hub.update_interval_secs,
         oracle_ts,
+        &signer,
     )
     .await;
 
@@ -164,8 +166,9 @@ async fn main() -> Result<()> {
         let sync_cfg = cfg.clone();
         let sync_registry = peer_registry.clone();
         let sync_notify = notify.clone();
+        let sync_signer = signer.clone();
         tokio::spawn(async move {
-            peers::run_peer_sync_loop(sync_cfg, sync_registry, sync_notify).await;
+            peers::run_peer_sync_loop(sync_cfg, sync_registry, sync_notify, sync_signer).await;
         });
         info!("peer sync loop spawned");
     }

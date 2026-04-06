@@ -1,8 +1,10 @@
 use axum::extract::State;
+use axum::http::StatusCode;
 use axum::response::Json;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use super::super::{AppState, PeerStatusJson};
+use super::update::{verify_auth_for, UpdateResponse};
 
 #[derive(Serialize)]
 pub(crate) struct HealthResponse {
@@ -28,11 +30,39 @@ pub(crate) struct StatusResponse {
     peers: Vec<PeerStatusJson>,
 }
 
+#[derive(Deserialize)]
+pub struct StatusRequest {
+    pub wallet: String,
+    pub signature: String,
+}
+
 pub async fn health() -> Json<HealthResponse> {
     Json(HealthResponse { status: "ok" })
 }
 
-pub async fn status(State(app): State<AppState>) -> Json<StatusResponse> {
+/// POST /status — returns full keeper status.
+///
+/// Requires unified challenge-response auth: `{ wallet, signature }`.
+/// The wallet must be whitelisted on OracleBatchUpdater.
+pub async fn status(
+    State(app): State<AppState>,
+    Json(body): Json<StatusRequest>,
+) -> Result<Json<StatusResponse>, (StatusCode, Json<UpdateResponse>)> {
+    let batch_updater = app.6;
+    let flow_rpc = &app.7;
+    let whitelist_cache = &app.12;
+
+    verify_auth_for(
+        &body.wallet,
+        &body.signature,
+        &app.11,
+        batch_updater,
+        flow_rpc,
+        whitelist_cache,
+        "/status",
+    )
+    .await?;
+
     let now = chrono::Utc::now().timestamp() as u64;
     let locked = app.0.read().await;
 
@@ -49,7 +79,6 @@ pub async fn status(State(app): State<AppState>) -> Json<StatusResponse> {
         })
         .collect();
 
-    // Build peer status list
     let registry = app.4.lock().await;
     let peers_json: Vec<PeerStatusJson> = registry
         .values()
@@ -65,11 +94,11 @@ pub async fn status(State(app): State<AppState>) -> Json<StatusResponse> {
         })
         .collect();
 
-    Json(StatusResponse {
+    Ok(Json(StatusResponse {
         spokes,
         last_cycle_at: locked.last_cycle_at,
         last_cycle_tx: locked.last_cycle_tx.clone(),
         update_interval_secs: locked.update_interval_secs,
         peers: peers_json,
-    })
+    }))
 }

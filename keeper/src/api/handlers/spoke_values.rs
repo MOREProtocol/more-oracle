@@ -1,10 +1,10 @@
 use axum::{extract::State, http::StatusCode, response::Json};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::spoke;
 
 use super::super::{AppState, SpokeReading};
-use super::update::UpdateResponse;
+use super::update::{verify_auth_for, UpdateResponse};
 
 #[derive(Serialize)]
 pub(crate) struct PeerSpokeValuesResponse {
@@ -25,82 +25,57 @@ pub(crate) struct LiveSpokeValuesResponse {
     readings: Vec<LiveSpokeReading>,
 }
 
+/// Unified auth body shared by spoke-value endpoints.
+#[derive(Deserialize)]
+pub struct AuthBody {
+    pub wallet: String,
+    pub signature: String,
+}
+
 pub async fn peer_spoke_values(
     State(app): State<AppState>,
-    headers: axum::http::HeaderMap,
+    Json(body): Json<AuthBody>,
 ) -> Result<Json<PeerSpokeValuesResponse>, (StatusCode, Json<UpdateResponse>)> {
-    // Authenticate via X-Keeper-Key header
-    let api_key = headers
-        .get("X-Keeper-Key")
-        .and_then(|v| v.to_str().ok())
-        .ok_or_else(|| {
-            (
-                StatusCode::UNAUTHORIZED,
-                Json(UpdateResponse {
-                    status: "error",
-                    message: "missing X-Keeper-Key header".into(),
-                }),
-            )
-        })?;
+    let batch_updater = app.6;
+    let flow_rpc = &app.7;
+    let whitelist_cache = &app.12;
 
-    // Check if this key matches any registered peer's incoming_api_key
-    let registry = app.4.lock().await;
-    let is_valid = registry
-        .values()
-        .any(|p| p.incoming_api_key == api_key);
-
-    if !is_valid {
-        return Err((
-            StatusCode::UNAUTHORIZED,
-            Json(UpdateResponse {
-                status: "error",
-                message: "invalid API key".into(),
-            }),
-        ));
-    }
-    drop(registry);
+    verify_auth_for(
+        &body.wallet,
+        &body.signature,
+        &app.11,
+        batch_updater,
+        flow_rpc,
+        whitelist_cache,
+        "/peers/spoke-values",
+    )
+    .await?;
 
     let state = app.0.read().await;
     let readings = state.last_spoke_readings.clone();
     let last_push_at = state.last_cycle_at;
 
-    Ok(Json(PeerSpokeValuesResponse {
-        readings,
-        last_push_at,
-    }))
+    Ok(Json(PeerSpokeValuesResponse { readings, last_push_at }))
 }
 
 pub async fn peer_spoke_values_live(
     State(app): State<AppState>,
-    headers: axum::http::HeaderMap,
+    Json(body): Json<AuthBody>,
 ) -> Result<Json<LiveSpokeValuesResponse>, (StatusCode, Json<UpdateResponse>)> {
-    // Authenticate via X-Keeper-Key header
-    let api_key = headers
-        .get("X-Keeper-Key")
-        .and_then(|v| v.to_str().ok())
-        .ok_or_else(|| {
-            (
-                StatusCode::UNAUTHORIZED,
-                Json(UpdateResponse {
-                    status: "error",
-                    message: "missing X-Keeper-Key header".into(),
-                }),
-            )
-        })?;
+    let batch_updater = app.6;
+    let flow_rpc = &app.7;
+    let whitelist_cache = &app.12;
 
-    let registry = app.4.lock().await;
-    let is_valid = registry.values().any(|p| p.incoming_api_key == api_key);
-    drop(registry);
-
-    if !is_valid {
-        return Err((
-            StatusCode::UNAUTHORIZED,
-            Json(UpdateResponse {
-                status: "error",
-                message: "invalid API key".into(),
-            }),
-        ));
-    }
+    verify_auth_for(
+        &body.wallet,
+        &body.signature,
+        &app.11,
+        batch_updater,
+        flow_rpc,
+        whitelist_cache,
+        "/peers/spoke-values/live",
+    )
+    .await?;
 
     let spokes = &app.10;
     let now = chrono::Utc::now().timestamp() as u64;
@@ -109,7 +84,6 @@ pub async fn peer_spoke_values_live(
     let readings = raw
         .into_iter()
         .map(|(name, value)| {
-            // read_all_spokes returns 1 as sentinel for failed/zero reads
             let source = if value == 1 { "failed" } else { "rpc" };
             LiveSpokeReading {
                 spoke: name,
