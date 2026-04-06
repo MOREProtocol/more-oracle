@@ -7,8 +7,9 @@ use axum::http::{Request, StatusCode};
 use axum::Router;
 use tower::ServiceExt as _;
 
-use crate::api::{AppState, ChallengeStore, KeeperState, SharedState};
+use crate::api::{AppState, ChallengeStore, KeeperState, SharedState, WalletChallengeStore};
 use crate::peer_registry::{new_peer_registry, new_pending_registrations, PeerInfo};
+use crate::security::WhitelistCache;
 use alloy::primitives::Address;
 
 fn build_test_app() -> Router {
@@ -23,6 +24,8 @@ fn build_test_app() -> Router {
     let keeper_url: Option<String> = None;
     let signer: Option<alloy::signers::local::PrivateKeySigner> = None;
     let spokes: Vec<crate::config::SpokeConfig> = vec![];
+    let wallet_challenges: WalletChallengeStore = Arc::new(Mutex::new(HashMap::new()));
+    let whitelist_cache = WhitelistCache::new();
 
     let app_state: AppState = (
         state,
@@ -36,22 +39,25 @@ fn build_test_app() -> Router {
         keeper_url,
         signer,
         spokes,
+        wallet_challenges,
+        whitelist_cache,
     );
 
     Router::new()
         .route("/health", axum::routing::get(super::handlers::health))
-        .route("/status", axum::routing::get(super::handlers::status))
+        .route("/status", axum::routing::post(super::handlers::status))
         .route("/challenge", axum::routing::get(super::handlers::get_challenge))
+        .route("/peers/challenge", axum::routing::get(super::handlers::get_peer_challenge))
         .route("/update", axum::routing::post(super::handlers::trigger_update))
         .route("/peers/register", axum::routing::post(super::handlers::peer_register))
         .route("/peers/verify", axum::routing::post(super::handlers::peer_verify))
-        .route("/peers/spoke-values", axum::routing::get(super::handlers::peer_spoke_values))
-        .route("/peers/spoke-values/live", axum::routing::get(super::handlers::peer_spoke_values_live))
+        .route("/peers/spoke-values", axum::routing::post(super::handlers::peer_spoke_values))
+        .route("/peers/spoke-values/live", axum::routing::post(super::handlers::peer_spoke_values_live))
         .route("/peers/notify", axum::routing::post(super::handlers::peer_notify))
         .with_state(app_state)
 }
 
-fn build_test_app_with_peer(incoming_api_key: &str) -> Router {
+fn build_test_app_with_challenge(wallet: Address, challenge: &str) -> Router {
     let state: SharedState = Arc::new(RwLock::new(KeeperState::default()));
     let notify = Arc::new(Notify::new());
     let curator = Address::ZERO;
@@ -63,21 +69,71 @@ fn build_test_app_with_peer(incoming_api_key: &str) -> Router {
     let keeper_url: Option<String> = None;
     let signer: Option<alloy::signers::local::PrivateKeySigner> = None;
     let spokes: Vec<crate::config::SpokeConfig> = vec![];
+    let wallet_challenges: WalletChallengeStore = Arc::new(Mutex::new(HashMap::new()));
+    let whitelist_cache = WhitelistCache::new();
 
-    // Manually insert a peer into the registry
     {
-        let registry_clone = peer_registry.clone();
-        let key = incoming_api_key.to_string();
-        // We need a blocking insert; use try_lock since we're still in single-threaded setup
-        let mut guard = registry_clone.try_lock().expect("registry lock during setup");
+        let mut guard = wallet_challenges.try_lock().expect("lock during setup");
+        let expires_at = chrono::Utc::now().timestamp() as u64 + 300;
+        guard.insert(
+            format!("{wallet:#x}"),
+            (challenge.to_string(), expires_at),
+        );
+    }
+
+    let app_state: AppState = (
+        state,
+        notify,
+        curator,
+        challenges,
+        peer_registry,
+        pending_registrations,
+        batch_updater,
+        flow_rpc,
+        keeper_url,
+        signer,
+        spokes,
+        wallet_challenges,
+        whitelist_cache,
+    );
+
+    Router::new()
+        .route("/health", axum::routing::get(super::handlers::health))
+        .route("/status", axum::routing::post(super::handlers::status))
+        .route("/challenge", axum::routing::get(super::handlers::get_challenge))
+        .route("/peers/challenge", axum::routing::get(super::handlers::get_peer_challenge))
+        .route("/update", axum::routing::post(super::handlers::trigger_update))
+        .route("/peers/register", axum::routing::post(super::handlers::peer_register))
+        .route("/peers/verify", axum::routing::post(super::handlers::peer_verify))
+        .route("/peers/spoke-values", axum::routing::post(super::handlers::peer_spoke_values))
+        .route("/peers/spoke-values/live", axum::routing::post(super::handlers::peer_spoke_values_live))
+        .route("/peers/notify", axum::routing::post(super::handlers::peer_notify))
+        .with_state(app_state)
+}
+
+fn build_test_app_with_peer(wallet: Address) -> Router {
+    let state: SharedState = Arc::new(RwLock::new(KeeperState::default()));
+    let notify = Arc::new(Notify::new());
+    let curator = Address::ZERO;
+    let challenges: ChallengeStore = Arc::new(Mutex::new(HashMap::new()));
+    let peer_registry = new_peer_registry();
+    let pending_registrations = new_pending_registrations();
+    let batch_updater = Address::ZERO;
+    let flow_rpc = "http://localhost:8545".to_string();
+    let keeper_url: Option<String> = None;
+    let signer: Option<alloy::signers::local::PrivateKeySigner> = None;
+    let spokes: Vec<crate::config::SpokeConfig> = vec![];
+    let wallet_challenges: WalletChallengeStore = Arc::new(Mutex::new(HashMap::new()));
+    let whitelist_cache = WhitelistCache::new();
+
+    {
+        let mut guard = peer_registry.try_lock().expect("registry lock during setup");
         let now = chrono::Utc::now().timestamp() as u64;
         guard.insert(
-            "http://peer:8080".to_string(),
+            "http://peer.example.com:8080".to_string(),
             PeerInfo {
-                url: "http://peer:8080".to_string(),
-                wallet: Address::ZERO,
-                incoming_api_key: key,
-                outgoing_api_key: None,
+                url: "http://peer.example.com:8080".to_string(),
+                wallet,
                 registered_at: now,
                 last_seen: Some(now),
                 last_push_at: None,
@@ -98,17 +154,20 @@ fn build_test_app_with_peer(incoming_api_key: &str) -> Router {
         keeper_url,
         signer,
         spokes,
+        wallet_challenges,
+        whitelist_cache,
     );
 
     Router::new()
         .route("/health", axum::routing::get(super::handlers::health))
-        .route("/status", axum::routing::get(super::handlers::status))
+        .route("/status", axum::routing::post(super::handlers::status))
         .route("/challenge", axum::routing::get(super::handlers::get_challenge))
+        .route("/peers/challenge", axum::routing::get(super::handlers::get_peer_challenge))
         .route("/update", axum::routing::post(super::handlers::trigger_update))
         .route("/peers/register", axum::routing::post(super::handlers::peer_register))
         .route("/peers/verify", axum::routing::post(super::handlers::peer_verify))
-        .route("/peers/spoke-values", axum::routing::get(super::handlers::peer_spoke_values))
-        .route("/peers/spoke-values/live", axum::routing::get(super::handlers::peer_spoke_values_live))
+        .route("/peers/spoke-values", axum::routing::post(super::handlers::peer_spoke_values))
+        .route("/peers/spoke-values/live", axum::routing::post(super::handlers::peer_spoke_values_live))
         .route("/peers/notify", axum::routing::post(super::handlers::peer_notify))
         .with_state(app_state)
 }
@@ -137,7 +196,8 @@ async fn test_health() {
 }
 
 #[tokio::test]
-async fn test_status_empty() {
+async fn test_status_requires_auth() {
+    // GET /status no longer exists; POST without body → 4xx
     let app = build_test_app();
 
     let req = Request::builder()
@@ -147,20 +207,36 @@ async fn test_status_empty() {
         .unwrap();
 
     let resp = app.oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
-
-    let bytes = body_bytes(resp.into_body()).await;
-    let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-
-    assert!(json["spokes"].is_array());
-    assert!(json["peers"].is_array());
-    assert_eq!(json["spokes"].as_array().unwrap().len(), 0);
-    assert_eq!(json["peers"].as_array().unwrap().len(), 0);
-    assert!(json["update_interval_secs"].is_number());
+    assert_eq!(resp.status(), StatusCode::METHOD_NOT_ALLOWED);
 }
 
 #[tokio::test]
-async fn test_challenge_returns_challenge() {
+async fn test_status_post_without_auth_returns_4xx() {
+    // POST /status without a challenge pre-seeded → 401
+    let app = build_test_app();
+
+    let body = serde_json::json!({
+        "wallet": "0x0000000000000000000000000000000000000001",
+        "signature": "0x000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
+    });
+
+    let req = Request::builder()
+        .method("POST")
+        .uri("/status")
+        .header("content-type", "application/json")
+        .body(Body::from(serde_json::to_vec(&body).unwrap()))
+        .unwrap();
+
+    let resp = app.oneshot(req).await.unwrap();
+    assert!(
+        resp.status() == StatusCode::UNAUTHORIZED || resp.status() == StatusCode::BAD_REQUEST,
+        "expected 4xx, got {}",
+        resp.status()
+    );
+}
+
+#[tokio::test]
+async fn test_challenge_returns_challenge_no_wallet() {
     let app = build_test_app();
 
     let req = Request::builder()
@@ -176,181 +252,224 @@ async fn test_challenge_returns_challenge() {
     let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
 
     let challenge = json["challenge"].as_str().unwrap();
-    assert!(challenge.starts_with("update:"), "challenge should start with 'update:', got: {challenge}");
+    assert!(
+        challenge.starts_with("update:"),
+        "generic challenge should start with 'update:', got: {challenge}"
+    );
     assert!(json["expires_at"].is_number());
 }
 
 #[tokio::test]
-async fn test_update_requires_valid_signature() {
+async fn test_update_missing_challenge_returns_401() {
     let app = build_test_app();
 
-    // First get a challenge
-    let challenge_req = Request::builder()
-        .method("GET")
-        .uri("/challenge")
-        .body(Body::empty())
-        .unwrap();
-
-    let challenge_resp = app.clone().oneshot(challenge_req).await.unwrap();
-    let bytes = body_bytes(challenge_resp.into_body()).await;
-    let challenge_json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-    let challenge = challenge_json["challenge"].as_str().unwrap();
-
-    // POST /update with a garbage signature
     let body = serde_json::json!({
-        "challenge": challenge,
+        "wallet": "0x0000000000000000000000000000000000000001",
         "signature": "0x000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
     });
 
-    let update_req = Request::builder()
+    let req = Request::builder()
         .method("POST")
         .uri("/update")
         .header("content-type", "application/json")
         .body(Body::from(serde_json::to_vec(&body).unwrap()))
         .unwrap();
 
-    let update_resp = app.oneshot(update_req).await.unwrap();
-    // Should fail — bad signature or wrong signer
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn test_update_wrong_signature_returns_4xx() {
+    let wallet = Address::ZERO;
+    let app = build_test_app_with_challenge(wallet, "keeper-auth:test-nonce-1234");
+
+    let body = serde_json::json!({
+        "wallet": format!("{wallet:#x}"),
+        "signature": "0x000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
+    });
+
+    let req = Request::builder()
+        .method("POST")
+        .uri("/update")
+        .header("content-type", "application/json")
+        .body(Body::from(serde_json::to_vec(&body).unwrap()))
+        .unwrap();
+
+    let resp = app.oneshot(req).await.unwrap();
     assert!(
-        update_resp.status() == StatusCode::BAD_REQUEST
-            || update_resp.status() == StatusCode::UNAUTHORIZED,
+        resp.status() == StatusCode::BAD_REQUEST || resp.status() == StatusCode::UNAUTHORIZED,
         "expected 400 or 401, got {}",
-        update_resp.status()
+        resp.status()
     );
 }
 
 #[tokio::test]
-async fn test_peer_register_returns_challenge() {
+async fn test_peer_register_returns_400_without_challenge() {
     let app = build_test_app();
 
-    let body = serde_json::json!({ "url": "http://peer:8080" });
+    let body = serde_json::json!({
+        "url": "https://1.2.3.4:8080",
+        "wallet": "0x0000000000000000000000000000000000000001",
+        "signature": "0xdeadbeef"
+    });
 
     let req = Request::builder()
         .method("POST")
         .uri("/peers/register")
         .header("content-type", "application/json")
         .body(Body::from(serde_json::to_vec(&body).unwrap()))
+        .unwrap();
+
+    let resp = app.oneshot(req).await.unwrap();
+    assert!(
+        resp.status() == StatusCode::UNAUTHORIZED || resp.status() == StatusCode::BAD_REQUEST,
+        "expected 401 or 400, got {}",
+        resp.status()
+    );
+}
+
+#[tokio::test]
+async fn test_peer_register_rejects_private_url() {
+    // URL validation runs before auth, so no valid sig is needed here.
+    let app = build_test_app();
+
+    let body = serde_json::json!({
+        "url": "http://192.168.1.1:8080",
+        "wallet": "0x0000000000000000000000000000000000000001",
+        "signature": "0xdeadbeef"
+    });
+
+    let req = Request::builder()
+        .method("POST")
+        .uri("/peers/register")
+        .header("content-type", "application/json")
+        .body(Body::from(serde_json::to_vec(&body).unwrap()))
+        .unwrap();
+
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    let bytes = body_bytes(resp.into_body()).await;
+    let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert!(
+        json["message"].as_str().unwrap_or("").contains("RFC1918"),
+        "expected RFC1918 rejection, got: {}",
+        json["message"]
+    );
+}
+
+#[tokio::test]
+async fn test_spoke_values_get_returns_405() {
+    let app = build_test_app();
+
+    let req = Request::builder()
+        .method("GET")
+        .uri("/peers/spoke-values")
+        .body(Body::empty())
+        .unwrap();
+
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::METHOD_NOT_ALLOWED);
+}
+
+#[tokio::test]
+async fn test_spoke_values_post_without_challenge_returns_401() {
+    let app = build_test_app();
+
+    let body = serde_json::json!({
+        "wallet": "0x0000000000000000000000000000000000000001",
+        "signature": "0x000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
+    });
+
+    let req = Request::builder()
+        .method("POST")
+        .uri("/peers/spoke-values")
+        .header("content-type", "application/json")
+        .body(Body::from(serde_json::to_vec(&body).unwrap()))
+        .unwrap();
+
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn test_peer_notify_rejects_loopback_url() {
+    let app = build_test_app();
+
+    let body = serde_json::json!({
+        "url": "http://127.0.0.1:8080",
+        "wallet": "0x0000000000000000000000000000000000000001",
+        "auth_wallet": "0x0000000000000000000000000000000000000002",
+        "auth_signature": "0xdeadbeef"
+    });
+
+    let req = Request::builder()
+        .method("POST")
+        .uri("/peers/notify")
+        .header("content-type", "application/json")
+        .body(Body::from(serde_json::to_vec(&body).unwrap()))
+        .unwrap();
+
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    let bytes = body_bytes(resp.into_body()).await;
+    let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert!(
+        json["message"].as_str().unwrap_or("").contains("loopback"),
+        "expected loopback rejection"
+    );
+}
+
+#[tokio::test]
+async fn test_security_headers_on_health() {
+    use axum::middleware;
+    use crate::api::AppState;
+
+    let state: SharedState = Arc::new(RwLock::new(KeeperState::default()));
+    let notify = Arc::new(Notify::new());
+    let challenges: ChallengeStore = Arc::new(Mutex::new(HashMap::new()));
+    let peer_registry = new_peer_registry();
+    let pending_registrations = new_pending_registrations();
+    let wallet_challenges: WalletChallengeStore = Arc::new(Mutex::new(HashMap::new()));
+    let whitelist_cache = WhitelistCache::new();
+
+    let app_state: AppState = (
+        state,
+        notify,
+        Address::ZERO,
+        challenges,
+        peer_registry,
+        pending_registrations,
+        Address::ZERO,
+        "http://localhost:8545".to_string(),
+        None,
+        None,
+        vec![],
+        wallet_challenges,
+        whitelist_cache,
+    );
+
+    let app = Router::new()
+        .route("/health", axum::routing::get(super::handlers::health))
+        .with_state(app_state)
+        .layer(middleware::from_fn(super::security_headers));
+
+    let req = Request::builder()
+        .method("GET")
+        .uri("/health")
+        .body(Body::empty())
         .unwrap();
 
     let resp = app.oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
-
-    let bytes = body_bytes(resp.into_body()).await;
-    let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-
-    assert!(json["challenge"].is_string());
-    assert!(json["expires_at"].is_number());
-}
-
-#[tokio::test]
-async fn test_peer_register_twice_same_url() {
-    let app = build_test_app();
-
-    let body = serde_json::json!({ "url": "http://peer:8080" });
-
-    // First registration
-    let req1 = Request::builder()
-        .method("POST")
-        .uri("/peers/register")
-        .header("content-type", "application/json")
-        .body(Body::from(serde_json::to_vec(&body).unwrap()))
-        .unwrap();
-    let resp1 = app.clone().oneshot(req1).await.unwrap();
-    assert_eq!(resp1.status(), StatusCode::OK);
-    let bytes1 = body_bytes(resp1.into_body()).await;
-    let json1: serde_json::Value = serde_json::from_slice(&bytes1).unwrap();
-    assert!(json1["challenge"].is_string());
-
-    // Second registration — overwrites the first challenge
-    let req2 = Request::builder()
-        .method("POST")
-        .uri("/peers/register")
-        .header("content-type", "application/json")
-        .body(Body::from(serde_json::to_vec(&body).unwrap()))
-        .unwrap();
-    let resp2 = app.oneshot(req2).await.unwrap();
-    assert_eq!(resp2.status(), StatusCode::OK);
-    let bytes2 = body_bytes(resp2.into_body()).await;
-    let json2: serde_json::Value = serde_json::from_slice(&bytes2).unwrap();
-    assert!(json2["challenge"].is_string());
-}
-
-#[tokio::test]
-async fn test_peer_verify_invalid_signature() {
-    let app = build_test_app();
-
-    // First register to get a challenge
-    let reg_body = serde_json::json!({ "url": "http://peer:8080" });
-    let reg_req = Request::builder()
-        .method("POST")
-        .uri("/peers/register")
-        .header("content-type", "application/json")
-        .body(Body::from(serde_json::to_vec(&reg_body).unwrap()))
-        .unwrap();
-    let reg_resp = app.clone().oneshot(reg_req).await.unwrap();
-    assert_eq!(reg_resp.status(), StatusCode::OK);
-
-    // Now verify with a garbage signature
-    let verify_body = serde_json::json!({
-        "url": "http://peer:8080",
-        "signature": "0xdeadbeef"
-    });
-
-    let verify_req = Request::builder()
-        .method("POST")
-        .uri("/peers/verify")
-        .header("content-type", "application/json")
-        .body(Body::from(serde_json::to_vec(&verify_body).unwrap()))
-        .unwrap();
-
-    let verify_resp = app.oneshot(verify_req).await.unwrap();
-    assert!(
-        verify_resp.status() == StatusCode::BAD_REQUEST
-            || verify_resp.status() == StatusCode::UNAUTHORIZED,
-        "expected 400 or 401, got {}",
-        verify_resp.status()
+    assert_eq!(
+        resp.headers().get("x-content-type-options").map(|v| v.to_str().unwrap()),
+        Some("nosniff")
     );
-}
-
-#[tokio::test]
-async fn test_spoke_values_requires_auth() {
-    let app = build_test_app();
-
-    let req = Request::builder()
-        .method("GET")
-        .uri("/peers/spoke-values")
-        .body(Body::empty())
-        .unwrap();
-
-    let resp = app.oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
-}
-
-#[tokio::test]
-async fn test_spoke_values_live_requires_auth() {
-    let app = build_test_app();
-
-    let req = Request::builder()
-        .method("GET")
-        .uri("/peers/spoke-values/live")
-        .body(Body::empty())
-        .unwrap();
-
-    let resp = app.oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
-}
-
-#[tokio::test]
-async fn test_spoke_values_invalid_key() {
-    let app = build_test_app_with_peer("correct-api-key");
-
-    let req = Request::builder()
-        .method("GET")
-        .uri("/peers/spoke-values")
-        .header("X-Keeper-Key", "wrong-api-key")
-        .body(Body::empty())
-        .unwrap();
-
-    let resp = app.oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        resp.headers().get("x-frame-options").map(|v| v.to_str().unwrap()),
+        Some("DENY")
+    );
 }
