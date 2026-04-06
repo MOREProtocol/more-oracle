@@ -21,6 +21,7 @@ use tracing::{info, warn};
 use crate::api::SpokeReading;
 use crate::config::RuntimeConfig;
 use crate::peer_registry::{PeerInfo, PeerRegistry};
+use crate::security::validate_peer_url;
 
 /// Minimal shape of the /status response we care about from a peer.
 #[derive(Deserialize)]
@@ -32,26 +33,12 @@ struct PeerStatus {
     last_push_at: Option<u64>,
 }
 
-/// Response from POST /peers/register.
+/// Response from GET /peers/challenge?wallet=...
 #[derive(Deserialize)]
-struct RegisterResponse {
+struct ChallengeResponse {
     challenge: String,
     #[allow(dead_code)]
     expires_at: u64,
-}
-
-/// Response from POST /peers/verify.
-#[derive(Deserialize)]
-struct VerifyResponse {
-    api_key: String,
-}
-
-/// Response from GET /peers/spoke-values (cached).
-#[derive(Deserialize)]
-struct SpokeValuesResponse {
-    readings: Vec<SpokeReading>,
-    #[allow(dead_code)]
-    last_push_at: Option<u64>,
 }
 
 /// Response from GET /peers/spoke-values/live (fresh RPC read).
@@ -69,9 +56,48 @@ struct LiveSpokeReading {
     at: u64,
 }
 
-/// Query all configured peer /status endpoints in parallel (5 s timeout each).
-/// Returns only peers whose `update_interval_secs` matches `update_interval_secs`.
-async fn query_peers(peers: &[String], update_interval_secs: u64) -> Vec<u64> {
+/// Fetch a challenge from a peer for our wallet, then sign it.
+/// Returns (wallet_hex, signature_hex).
+async fn fetch_and_sign_challenge(
+    client: &reqwest::Client,
+    peer_base: &str,
+    signer: &PrivateKeySigner,
+) -> Result<(String, String)> {
+    let our_wallet = signer.address();
+    let challenge_url = format!(
+        "{}/peers/challenge?wallet={our_wallet:#x}",
+        peer_base.trim_end_matches('/')
+    );
+
+    let resp = client
+        .get(&challenge_url)
+        .send()
+        .await
+        .with_context(|| format!("GET {challenge_url} failed"))?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        eyre::bail!("GET {challenge_url} returned {status}: {body}");
+    }
+
+    let cr: ChallengeResponse = resp
+        .json()
+        .await
+        .context("failed to parse challenge response")?;
+
+    let sig = signer
+        .sign_message(cr.challenge.as_bytes())
+        .await
+        .context("failed to sign challenge")?;
+
+    let sig_hex = format!("0x{}", alloy::hex::encode(sig.as_bytes()));
+    Ok((format!("{our_wallet:#x}"), sig_hex))
+}
+
+/// Query all configured peer POST /status endpoints in parallel (5 s timeout each).
+/// Returns only peers whose `update_interval_secs` matches ours.
+async fn query_peers(peers: &[String], update_interval_secs: u64, signer: &PrivateKeySigner) -> Vec<u64> {
     let client = match reqwest::Client::builder()
         .timeout(Duration::from_secs(5))
         .build()
@@ -83,69 +109,62 @@ async fn query_peers(peers: &[String], update_interval_secs: u64) -> Vec<u64> {
         }
     };
 
-    let futures: Vec<_> = peers
-        .iter()
-        .map(|peer_url| {
-            let client = client.clone();
-            let url = format!("{}/status", peer_url.trim_end_matches('/'));
-            let peer_url = peer_url.clone();
-            async move {
-                match client.get(&url).send().await {
-                    Ok(resp) => match resp.json::<PeerStatus>().await {
-                        Ok(status) => {
-                            let peer_interval = status.update_interval_secs.unwrap_or(0);
-                            if peer_interval != update_interval_secs {
-                                info!(
-                                    peer = %peer_url,
-                                    peer_interval,
-                                    our_interval = update_interval_secs,
-                                    "Peer has different update_interval -- ignoring"
-                                );
-                                return None;
-                            }
-                            status.last_cycle_at
-                        }
-                        Err(e) => {
-                            warn!(peer = %peer_url, error = %e, "Failed to parse peer /status response");
-                            None
-                        }
-                    },
-                    Err(e) => {
-                        warn!(peer = %peer_url, error = %e, "Failed to reach peer /status");
-                        None
+    let mut results = Vec::new();
+    for peer_url in peers {
+        if let Err(reason) = validate_peer_url(peer_url) {
+            warn!(peer_url = %peer_url, reason = %reason, "query_peers: skipping invalid URL");
+            continue;
+        }
+        let base = peer_url.trim_end_matches('/');
+        let (wallet_hex, sig_hex) = match fetch_and_sign_challenge(&client, base, signer).await {
+            Ok(pair) => pair,
+            Err(e) => {
+                warn!(peer = %peer_url, error = %e, "query_peers: failed to get challenge");
+                continue;
+            }
+        };
+        let url = format!("{base}/status");
+        let body = serde_json::json!({ "wallet": wallet_hex, "signature": sig_hex });
+        match client.post(&url).json(&body).send().await {
+            Ok(resp) => match resp.json::<PeerStatus>().await {
+                Ok(status) => {
+                    let peer_interval = status.update_interval_secs.unwrap_or(0);
+                    if peer_interval != update_interval_secs {
+                        info!(
+                            peer = %peer_url,
+                            peer_interval,
+                            our_interval = update_interval_secs,
+                            "Peer has different update_interval -- ignoring"
+                        );
+                        continue;
+                    }
+                    if let Some(ts) = status.last_cycle_at {
+                        results.push(ts);
                     }
                 }
-            }
-        })
-        .collect();
-
-    futures::future::join_all(futures)
-        .await
-        .into_iter()
-        .flatten()
-        .collect()
+                Err(e) => warn!(peer = %peer_url, error = %e, "Failed to parse peer /status response"),
+            },
+            Err(e) => warn!(peer = %peer_url, error = %e, "Failed to reach peer /status"),
+        }
+    }
+    results
 }
 
-/// On startup, query all peer /status endpoints and calculate the optimal
+/// On startup, query all peer POST /status endpoints and calculate the optimal
 /// startup sleep so this keeper fills the largest gap in the push schedule.
-///
-/// `oracle_last_timestamp` is the value from `latestTimestamp()` on-chain --
-/// it represents the last time *any* keeper pushed an update, used as an
-/// additional position in the gap calculation.
 pub async fn calculate_startup_sleep(
     peers: &[String],
     update_interval_secs: u64,
     oracle_last_timestamp: u64,
+    signer: &PrivateKeySigner,
 ) -> Duration {
     if peers.is_empty() {
         info!("No peers configured -- starting immediately");
         return Duration::ZERO;
     }
 
-    // 1. Query all peers in parallel with 5 s timeout each
-    let peer_last_cycles = query_peers(peers, update_interval_secs).await;
+    let peer_last_cycles = query_peers(peers, update_interval_secs, signer).await;
 
-    // 2. If no matching peers respond -> start immediately
     if peer_last_cycles.is_empty() {
         info!("No reachable peers with matching interval -- starting immediately");
         return Duration::ZERO;
@@ -153,15 +172,11 @@ pub async fn calculate_startup_sleep(
 
     let interval = update_interval_secs;
 
-    // 3. Collect cycle positions (seconds into the current interval window)
-    // Include the oracle's last timestamp as a virtual "unknown peer" position
     let mut positions: Vec<u64> = peer_last_cycles.iter().map(|ts| ts % interval).collect();
-
     if oracle_last_timestamp > 0 {
         positions.push(oracle_last_timestamp % interval);
     }
 
-    // Deduplicate and sort
     positions.sort_unstable();
     positions.dedup();
 
@@ -171,7 +186,6 @@ pub async fn calculate_startup_sleep(
         "Peer cycle positions (seconds into interval)"
     );
 
-    // 4. Find the largest gap in the circular schedule
     let n = positions.len();
     let mut largest_gap_size: u64 = 0;
     let mut largest_gap_start: u64 = 0;
@@ -181,7 +195,6 @@ pub async fn calculate_startup_sleep(
         let gap_end = if i + 1 < n {
             positions[i + 1]
         } else {
-            // Wrap-around: distance from last position back to first + interval
             positions[0] + interval
         };
         let gap_size = gap_end.saturating_sub(gap_start);
@@ -191,21 +204,16 @@ pub async fn calculate_startup_sleep(
         }
     }
 
-    // 5. Target = middle of the largest gap
     let target = (largest_gap_start + largest_gap_size / 2) % interval;
-
-    // 6. current_position = now % interval
     let now_secs = chrono::Utc::now().timestamp() as u64;
     let current_position = now_secs % interval;
 
-    // 7. Sleep = distance from current_position to target (forward in cycle)
     let sleep_secs = if target >= current_position {
         target - current_position
     } else {
         interval - current_position + target
     };
 
-    // Cap at one full interval
     let sleep_secs = sleep_secs.min(interval);
 
     info!(
@@ -220,32 +228,44 @@ pub async fn calculate_startup_sleep(
     Duration::from_secs(sleep_secs)
 }
 
-// -- Peer coordination functions -----------------------------------------------
+// ── Peer coordination ─────────────────────────────────────────────────────────
 
-/// Register this keeper with a remote peer using the challenge/verify flow.
+/// Register this keeper with a remote peer using the new unified challenge-response flow.
 ///
-/// 1. POST {peer_url}/peers/register with our URL
-/// 2. Receive challenge
-/// 3. Sign challenge with our signer (EIP-191)
-/// 4. POST {peer_url}/peers/verify with URL + signature
-/// 5. Returns the API key the peer generated for us
+/// 1. GET {peer_url}/peers/challenge?wallet={our_wallet} — check whitelist + get challenge
+/// 2. Sign challenge with KEEPER_PRIVATE_KEY (EIP-191)
+/// 3. POST {peer_url}/peers/register with { url, wallet, signature }
+///
+/// Returns () on success (no API key in new model).
 pub async fn register_with_peer(
     peer_url: &str,
     our_url: &str,
     signer: &PrivateKeySigner,
     _batch_updater: Address,
     _flow_rpc: &str,
-) -> Result<String> {
+) -> Result<()> {
+    // Validate the peer URL before making any request
+    validate_peer_url(peer_url).map_err(|e| eyre::eyre!(e))?;
+
     let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(5))
+        .timeout(Duration::from_secs(10))
         .build()
         .context("failed to build HTTP client")?;
 
     let base = peer_url.trim_end_matches('/');
 
-    // Step 1: POST /peers/register
+    // Step 1: Fetch challenge and sign it
+    let (wallet_hex, sig_hex) = fetch_and_sign_challenge(&client, base, signer)
+        .await
+        .with_context(|| format!("failed to obtain challenge from {base}"))?;
+
+    // Step 2: POST /peers/register
     let register_url = format!("{base}/peers/register");
-    let register_body = serde_json::json!({ "url": our_url });
+    let register_body = serde_json::json!({
+        "url": our_url,
+        "wallet": wallet_hex,
+        "signature": sig_hex,
+    });
 
     let resp = client
         .post(&register_url)
@@ -260,48 +280,11 @@ pub async fn register_with_peer(
         eyre::bail!("POST {register_url} returned {status}: {body}");
     }
 
-    let register_resp: RegisterResponse = resp
-        .json()
-        .await
-        .context("failed to parse register response")?;
-
-    // Step 2: Sign the challenge (EIP-191 personal_sign)
-    let signature = signer
-        .sign_message(register_resp.challenge.as_bytes())
-        .await
-        .context("failed to sign peer challenge")?;
-
-    let sig_hex = format!("0x{}", alloy::hex::encode(signature.as_bytes()));
-
-    // Step 3: POST /peers/verify
-    let verify_url = format!("{base}/peers/verify");
-    let verify_body = serde_json::json!({
-        "url": our_url,
-        "signature": sig_hex,
-    });
-
-    let resp = client
-        .post(&verify_url)
-        .json(&verify_body)
-        .send()
-        .await
-        .with_context(|| format!("POST {verify_url} failed"))?;
-
-    if !resp.status().is_success() {
-        let status = resp.status();
-        let body = resp.text().await.unwrap_or_default();
-        eyre::bail!("POST {verify_url} returned {status}: {body}");
-    }
-
-    let verify_resp: VerifyResponse = resp
-        .json()
-        .await
-        .context("failed to parse verify response")?;
-
-    Ok(verify_resp.api_key)
+    info!(peer_url = %peer_url, "peer registration succeeded");
+    Ok(())
 }
 
-/// Attempt registration with all configured peers.
+/// Attempt registration with all configured peers on startup.
 pub async fn attempt_peer_registrations(
     cfg: &RuntimeConfig,
     signer: &PrivateKeySigner,
@@ -316,6 +299,12 @@ pub async fn attempt_peer_registrations(
     };
 
     for peer_url in &cfg.hub.peers {
+        // Validate URL before attempting
+        if let Err(reason) = validate_peer_url(peer_url) {
+            warn!(peer_url = %peer_url, reason = %reason, "skipping peer with invalid URL");
+            continue;
+        }
+
         info!(peer_url = %peer_url, "attempting peer registration");
 
         match register_with_peer(
@@ -327,73 +316,69 @@ pub async fn attempt_peer_registrations(
         )
         .await
         {
-            Ok(api_key) => {
+            Ok(()) => {
                 let now = chrono::Utc::now().timestamp() as u64;
                 let mut registry = peer_registry.lock().await;
-
-                // If the peer already exists (from them registering with us), update outgoing key.
-                // Otherwise create a new entry (we don't know their wallet yet).
-                if let Some(info) = registry.get_mut(peer_url) {
-                    info.outgoing_api_key = Some(api_key);
-                    info!(
-                        peer_url = %peer_url,
-                        "peer registration succeeded (updated existing entry)"
-                    );
-                } else {
-                    registry.insert(
-                        peer_url.clone(),
-                        PeerInfo {
-                            url: peer_url.clone(),
-                            wallet: Address::ZERO, // will be updated when they register with us
-                            incoming_api_key: String::new(),
-                            outgoing_api_key: Some(api_key),
-                            registered_at: now,
-                            last_seen: None,
-                            last_push_at: None,
-                            active: true,
-                        },
-                    );
-                    info!(
-                        peer_url = %peer_url,
-                        "peer registration succeeded (created new entry)"
-                    );
-                }
+                registry
+                    .entry(peer_url.clone())
+                    .and_modify(|info| {
+                        info.last_seen = Some(now);
+                        info.active = true;
+                    })
+                    .or_insert_with(|| PeerInfo {
+                        url: peer_url.clone(),
+                        wallet: signer.address(), // approximate — peer may differ
+                        registered_at: now,
+                        last_seen: Some(now),
+                        last_push_at: None,
+                        active: true,
+                    });
+                info!(peer_url = %peer_url, "peer registration succeeded");
             }
             Err(e) => {
-                warn!(
-                    peer_url = %peer_url,
-                    error = %e,
-                    "peer registration failed"
-                );
+                warn!(peer_url = %peer_url, error = %e, "peer registration failed");
             }
         }
     }
 }
 
-/// Query a peer's spoke values using the API key they gave us.
+/// Query a peer's spoke values using unified challenge-response auth.
 pub async fn query_peer_spoke_values(
     peer_url: &str,
-    api_key: &str,
+    signer: &PrivateKeySigner,
 ) -> Result<Vec<SpokeReading>> {
+    validate_peer_url(peer_url).map_err(|e| eyre::eyre!(e))?;
+
     let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(5))
+        .timeout(Duration::from_secs(10))
         .build()
         .context("failed to build HTTP client")?;
 
-    // Use /live endpoint — reads fresh from RPC right now, not cached values
-    let url = format!("{}/peers/spoke-values/live", peer_url.trim_end_matches('/'));
+    let base = peer_url.trim_end_matches('/');
+
+    // Step 1: Fetch challenge from /peers/challenge
+    let (wallet_hex, sig_hex) = fetch_and_sign_challenge(&client, base, signer)
+        .await
+        .with_context(|| format!("failed to obtain challenge from {base}"))?;
+
+    // Step 2: POST /peers/spoke-values/live with auth body
+    let url = format!("{base}/peers/spoke-values/live");
+    let body = serde_json::json!({
+        "wallet": wallet_hex,
+        "signature": sig_hex,
+    });
 
     let resp = client
-        .get(&url)
-        .header("X-Keeper-Key", api_key)
+        .post(&url)
+        .json(&body)
         .send()
         .await
-        .with_context(|| format!("GET {url} failed"))?;
+        .with_context(|| format!("POST {url} failed"))?;
 
     if !resp.status().is_success() {
         let status = resp.status();
         let body = resp.text().await.unwrap_or_default();
-        eyre::bail!("GET {url} returned {status}: {body}");
+        eyre::bail!("POST {url} returned {status}: {body}");
     }
 
     let parsed: LiveSpokeValuesResponse = resp
@@ -401,7 +386,6 @@ pub async fn query_peer_spoke_values(
         .await
         .context("failed to parse live spoke-values response")?;
 
-    // Convert to SpokeReading format used by cross_validate_and_resolve
     let readings = parsed
         .readings
         .into_iter()
@@ -420,55 +404,54 @@ pub async fn query_peer_spoke_values(
 }
 
 /// Cross-validate our readings against peer readings and resolve fallbacks.
-///
-/// - If our read failed ("failed" source or value == 1 with fallback): use peer value.
-/// - If values diverge > 100 bps between us and a peer: log warning.
-/// - Returns resolved `Vec<(spoke_name, value)>`.
 pub async fn cross_validate_and_resolve(
     our_readings: &[(String, u128)],
     peer_registry: &PeerRegistry,
-    _cfg: &RuntimeConfig,
+    cfg: &RuntimeConfig,
 ) -> Vec<(String, u128)> {
     const DIVERGENCE_THRESHOLD_BPS: u64 = 100;
 
-    // Collect peer readings
-    let registry = peer_registry.lock().await;
+    // Build signer from config for peer requests
+    let signer = match std::str::FromStr::from_str(&cfg.keeper_private_key) {
+        Ok(s) => s,
+        Err(e) => {
+            warn!(error = %e, "cross_validate: invalid KEEPER_PRIVATE_KEY, skipping peer queries");
+            return our_readings.to_vec();
+        }
+    };
+    let signer: PrivateKeySigner = signer;
+
+    // Collect active peer URLs
+    let peer_urls: Vec<String> = {
+        let registry = peer_registry.lock().await;
+        registry
+            .values()
+            .filter(|p| p.active)
+            .map(|p| p.url.clone())
+            .collect()
+    };
+
     let mut peer_values: Vec<Vec<SpokeReading>> = Vec::new();
 
-    for (_, peer_info) in registry.iter() {
-        if !peer_info.active {
-            continue;
-        }
-        let api_key = match &peer_info.outgoing_api_key {
-            Some(k) => k.clone(),
-            None => continue,
-        };
-        let peer_url = peer_info.url.clone();
-        // Query peer spoke values (best effort)
-        match query_peer_spoke_values(&peer_url, &api_key).await {
+    for peer_url in &peer_urls {
+        match query_peer_spoke_values(peer_url, &signer).await {
             Ok(readings) => {
                 peer_values.push(readings);
             }
             Err(e) => {
-                warn!(
-                    peer_url = %peer_url,
-                    error = %e,
-                    "failed to query peer spoke values"
-                );
+                warn!(peer_url = %peer_url, error = %e, "failed to query peer spoke values");
             }
         }
     }
-    drop(registry);
 
     let mut resolved: Vec<(String, u128)> = Vec::with_capacity(our_readings.len());
 
     for (name, our_value) in our_readings {
-        let our_failed = *our_value <= 1; // read_all_spokes uses 1 as fallback for failures
+        let our_failed = *our_value <= 1;
 
-        // Collect peer values for this spoke
         let peer_vals: Vec<u128> = peer_values
             .iter()
-            .flat_map(|readings| {
+            .flat_map(|readings: &Vec<SpokeReading>| {
                 readings
                     .iter()
                     .filter(|r| r.spoke == *name && r.source != "failed" && r.value > 1)
@@ -477,18 +460,12 @@ pub async fn cross_validate_and_resolve(
             .collect();
 
         if our_failed && !peer_vals.is_empty() {
-            // RPC fallback from peer
-            let fallback_value = peer_vals[0]; // use first available peer value
-            info!(
-                spoke = %name,
-                peer_value = fallback_value,
-                "RPC fallback from peer"
-            );
+            let fallback_value = peer_vals[0];
+            info!(spoke = %name, peer_value = fallback_value, "RPC fallback from peer");
             resolved.push((name.clone(), fallback_value));
             continue;
         }
 
-        // Check for divergence
         if !our_failed {
             for &pv in &peer_vals {
                 let divergence = calculate_bps(*our_value, pv);
@@ -528,11 +505,12 @@ fn calculate_bps(a: u128, b: u128) -> u64 {
     }
 }
 
-/// Peer sync loop: runs every 60s, polls peer /status, detects failover.
+/// Peer sync loop: runs every 60s, polls peer POST /status, detects failover.
 pub async fn run_peer_sync_loop(
     cfg: RuntimeConfig,
     peer_registry: PeerRegistry,
     notify: Arc<Notify>,
+    signer: PrivateKeySigner,
 ) {
     let interval = Duration::from_secs(60);
     let client = match reqwest::Client::builder()
@@ -549,17 +527,32 @@ pub async fn run_peer_sync_loop(
     loop {
         tokio::time::sleep(interval).await;
 
-        let registry = peer_registry.lock().await;
+        let peer_urls: Vec<String> = {
+            let registry = peer_registry.lock().await;
+            registry.keys().cloned().collect()
+        };
+
         let now = chrono::Utc::now().timestamp() as u64;
-
-        let peer_urls: Vec<String> = registry.keys().cloned().collect();
-        drop(registry);
-
         const SIX_HOURS_SECS: u64 = 6 * 60 * 60;
 
         for peer_url in &peer_urls {
-            let url = format!("{}/status", peer_url.trim_end_matches('/'));
-            match client.get(&url).send().await {
+            if let Err(reason) = validate_peer_url(peer_url) {
+                warn!(peer_url = %peer_url, reason = %reason, "peer sync: skipping invalid URL");
+                continue;
+            }
+
+            let base = peer_url.trim_end_matches('/');
+            let auth = fetch_and_sign_challenge(&client, base, &signer).await;
+            let (wallet_hex, sig_hex) = match auth {
+                Ok(pair) => pair,
+                Err(e) => {
+                    warn!(peer_url = %peer_url, error = %e, "peer sync: failed to get challenge for /status");
+                    continue;
+                }
+            };
+            let url = format!("{base}/status");
+            let body = serde_json::json!({ "wallet": wallet_hex, "signature": sig_hex });
+            match client.post(&url).json(&body).send().await {
                 Ok(resp) => {
                     if let Ok(status) = resp.json::<PeerStatus>().await {
                         let mut registry = peer_registry.lock().await;
@@ -572,16 +565,12 @@ pub async fn run_peer_sync_loop(
                     }
                 }
                 Err(e) => {
-                    warn!(
-                        peer_url = %peer_url,
-                        error = %e,
-                        "peer sync: failed to reach peer /status"
-                    );
+                    warn!(peer_url = %peer_url, error = %e, "peer sync: failed to reach peer /status");
                 }
             }
         }
 
-        // Inactivity timeout: mark peers inactive if no successful poll for 6h
+        // Inactivity timeout: mark peers inactive after 6h, then evict
         {
             let mut registry = peer_registry.lock().await;
             for (url, info) in registry.iter_mut() {
@@ -593,16 +582,14 @@ pub async fn run_peer_sync_loop(
                     info.active = false;
                     warn!(
                         peer_url = %url,
-                        "peer marked inactive — no response for 6h, will re-register on next startup"
+                        "peer marked inactive — no response for 6h"
                     );
                 }
             }
-            // Evict inactive peers from the registry — they must re-register from scratch
             registry.retain(|_, v| v.active);
         }
 
-        // Failover detection: if any peer's last_push_at is too old, wake scheduled loop
-        // Only consider active peers
+        // Failover detection
         let registry = peer_registry.lock().await;
         let failover_threshold = cfg.hub.update_interval_secs + 120;
 
@@ -617,7 +604,7 @@ pub async fn run_peer_sync_loop(
                         "peer appears stale -- triggering early update cycle"
                     );
                     notify.notify_one();
-                    break; // one notification is enough
+                    break;
                 }
             }
         }

@@ -33,9 +33,10 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 eyre = "0.6"
 chrono = "0.4"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
-axum = "0.7"
+axum = { version = "0.7", features = ["macros"] }
+tower = { version = "0.4", features = ["timeout", "util", "limit"] }
+tower-http = { version = "0.6", features = ["set-header", "timeout", "limit"] }
 uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]
-tower = { version = "0.4", features = ["util"] }
 http-body-util = "0.1"
