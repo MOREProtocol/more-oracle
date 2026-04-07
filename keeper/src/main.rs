@@ -93,6 +93,21 @@ async fn main() -> Result<()> {
 
     info!("Running multicall loop for {} active spoke(s)", active_spokes.len());
 
+    // Startup Telegram notification
+    if let Some(tg) = &cfg.telegram {
+        let spoke_names: Vec<&str> = active_spokes.iter().map(|s| s.name.as_str()).collect();
+        tg.send(format!(
+            "✅ <b>Keeper started</b>\n\
+             Spokes: <code>{}</code>\n\
+             Update interval: {}s | Monitor: {}s\n\
+             Circuit breaker: on-chain | Drift: {} bps / 24 h",
+            spoke_names.join(", "),
+            cfg.hub.update_interval_secs,
+            cfg.hub.monitor_interval_secs,
+            cfg.hub.max_cumulative_drift_bps,
+        ));
+    }
+
     // Shared state between HTTP API and main loop
     let shared_state: SharedState = Arc::new(tokio::sync::RwLock::new(KeeperState {
         update_interval_secs: cfg.hub.update_interval_secs,
