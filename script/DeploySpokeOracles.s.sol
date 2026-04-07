@@ -29,7 +29,9 @@ contract DeploySpokeOracles is Script {
     address constant VAULT              = 0xaf46A54208CE9924B7577AFf146dfD65eB193861;
     address constant HUB_ASSET          = 0x99aF3EeA856556646C98c8B9b2548Fe815240750; // PYUSD0
 
-    uint8  constant SPOKE_ASSET_DECIMALS = 6; // PYUSD on all spokes
+    // spokeAssetDecimals is NOT hardcoded — read per-spoke from env vars set by
+    // deploy-spokes.sh, which queries each chain via cast before running forge.
+    // This prevents H-5 decimal misconfiguration for multi-asset spokes.
 
     // ── Spoke registry ───────────────────────────────────────────────────────
 
@@ -71,13 +73,20 @@ contract DeploySpokeOracles is Script {
         for (uint256 i = 0; i < spokes.length; i++) {
             Spoke memory s = spokes[i];
 
+            // Read decimals from env var set by deploy-spokes.sh (e.g. DECIMALS_ARBITRUM=6).
+            // Fallback to 6 if not set so the script still works standalone.
+            string memory decimalsKey = string(abi.encodePacked("DECIMALS_", toUpper(s.name)));
+            uint8 spokeDecimals = uint8(vm.envOr(decimalsKey, uint256(6)));
+
+            console.log(string(abi.encodePacked("[decimals] ", s.name, ":")), spokeDecimals);
+
             SpokeVaultOracle oracle = new SpokeVaultOracle(
                 ORACLE_REGISTRY,
                 HUB_ASSET,
-                SPOKE_ASSET_DECIMALS,
+                spokeDecimals,
                 s.spokeVault,
                 s.eid,
-                string(abi.encodePacked("SpokeVaultOracle/", s.name, "/PYUSD")),
+                string(abi.encodePacked("SpokeVaultOracle/", s.name)),
                 deployer
             );
 
