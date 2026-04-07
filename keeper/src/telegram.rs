@@ -4,15 +4,23 @@
 //! If either is missing the notifier is disabled — keeper runs normally without alerts.
 //! All sends are fire-and-forget; a Telegram failure never blocks the keeper.
 
+use std::{
+    collections::HashMap,
+    sync::{Arc, Mutex},
+};
 use tracing::{debug, warn};
 
 const TELEGRAM_API: &str = "https://api.telegram.org";
+/// Minimum seconds between repeated alerts for the same key.
+const COOLDOWN_SECS: u64 = 3600; // 1 hour
 
 #[derive(Debug, Clone)]
 pub struct TelegramNotifier {
     token: String,
     chat_id: String,
     client: reqwest::Client,
+    /// last-sent timestamps keyed by alert type + spoke/oracle identifier
+    cooldown: Arc<Mutex<HashMap<String, u64>>>,
 }
 
 impl TelegramNotifier {
@@ -27,7 +35,21 @@ impl TelegramNotifier {
             token,
             chat_id,
             client: reqwest::Client::new(),
+            cooldown: Arc::new(Mutex::new(HashMap::new())),
         })
+    }
+
+    /// Returns true if enough time has passed since the last alert for this key.
+    fn check_cooldown(&self, key: &str) -> bool {
+        let now = chrono::Utc::now().timestamp() as u64;
+        let mut map = self.cooldown.lock().unwrap();
+        let last = map.get(key).copied().unwrap_or(0);
+        if now.saturating_sub(last) >= COOLDOWN_SECS {
+            map.insert(key.to_string(), now);
+            true
+        } else {
+            false
+        }
     }
 
     /// Send a message. Spawns a background task — never blocks the caller.
@@ -58,6 +80,7 @@ impl TelegramNotifier {
     // ── Alert helpers ────────────────────────────────────────────────────────
 
     pub fn drift_alert(&self, spoke: &str, oracle: &str, max_bps: u64) {
+        if !self.check_cooldown(&format!("drift:{spoke}")) { return; }
         self.send(format!(
             "🚨 <b>DRIFT ALERT — oracle update blocked</b>\n\
              Spoke: <code>{spoke}</code>\n\
@@ -106,6 +129,7 @@ impl TelegramNotifier {
     }
 
     pub fn individual_update_failed(&self, oracle: &str, error: &str) {
+        if !self.check_cooldown(&format!("update_failed:{oracle}")) { return; }
         self.send(format!(
             "⚠️ <b>Oracle update failed</b>\n\
              Oracle: <code>{oracle}</code>\n\
@@ -123,6 +147,7 @@ impl TelegramNotifier {
     }
 
     pub fn peer_divergence(&self, spoke: &str, our_value: u128, peer_value: u128, divergence_bps: u64) {
+        if !self.check_cooldown(&format!("divergence:{spoke}")) { return; }
         self.send(format!(
             "⚠️ <b>Keeper divergence — spoke value mismatch</b>\n\
              Spoke: <code>{spoke}</code>\n\
@@ -135,6 +160,7 @@ impl TelegramNotifier {
     }
 
     pub fn both_keepers_failed(&self, spoke: &str) {
+        if !self.check_cooldown(&format!("both_failed:{spoke}")) { return; }
         self.send(format!(
             "🔴 <b>Both keepers failed to read spoke</b>\n\
              Spoke: <code>{spoke}</code>\n\

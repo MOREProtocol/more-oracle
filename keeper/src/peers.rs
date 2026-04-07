@@ -466,8 +466,8 @@ pub async fn cross_validate_and_resolve(
             continue;
         }
 
-        // Both keepers failed to read this spoke
-        if our_failed && peer_vals.is_empty() {
+        // Both keepers failed to read this spoke — only alert if peers exist
+        if our_failed && peer_vals.is_empty() && !peer_urls.is_empty() {
             warn!(spoke = %name, "both keepers failed to read spoke — no reliable value");
             if let Some(tg) = &cfg.telegram {
                 tg.both_keepers_failed(name);
