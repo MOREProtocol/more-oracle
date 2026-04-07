@@ -106,6 +106,8 @@ pub struct RuntimeConfig {
     pub keeper_private_key: String,
     /// Optional RPC overrides from env (RPC_FLOW, RPC_ARBITRUM, …)
     pub rpc_overrides: HashMap<String, String>,
+    /// Telegram notifier — None if TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID not set
+    pub telegram: Option<crate::telegram::TelegramNotifier>,
 }
 
 impl RuntimeConfig {
@@ -148,11 +150,19 @@ impl RuntimeConfig {
             }
         }
 
+        let telegram = crate::telegram::TelegramNotifier::from_env();
+        if telegram.is_some() {
+            tracing::info!("telegram: notifications enabled");
+        } else {
+            tracing::info!("telegram: TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID not set — notifications disabled");
+        }
+
         Ok(RuntimeConfig {
             hub: cfg.hub,
             spokes: cfg.spokes,
             keeper_private_key,
             rpc_overrides,
+            telegram,
         })
     }
 

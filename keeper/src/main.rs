@@ -7,6 +7,7 @@ mod peer_registry;
 mod peers;
 mod security;
 mod spoke;
+mod telegram;
 
 use alloy::{primitives::Address, signers::local::PrivateKeySigner};
 use api::{KeeperState, SharedState, SpokeReading, SpokeState};
@@ -331,6 +332,9 @@ async fn run_monitor_loop(
                         error = %e,
                         "monitor: early push failed"
                     );
+                    if let Some(tg) = &cfg.telegram {
+                        tg.monitor_push_failed(name, &e.to_string());
+                    }
                 }
             }
         }
@@ -449,11 +453,20 @@ async fn run_scheduled_loop(
                         calls.push((*oracle_addr, *total_assets));
                     } else {
                         skipped_drift += 1;
+                        let spoke_name = spokes
+                            .iter()
+                            .find(|s| s.oracle_address.as_deref().map(|a| a.to_lowercase()) == Some(oracle_str.to_lowercase()))
+                            .map(|s| s.name.as_str())
+                            .unwrap_or("unknown");
                         warn!(
                             oracle = %oracle_str,
+                            spoke = %spoke_name,
                             total_assets,
                             "skipping oracle due to cumulative drift protection"
                         );
+                        if let Some(tg) = &cfg.telegram {
+                            tg.drift_alert(spoke_name, &oracle_str, cfg.hub.max_cumulative_drift_bps);
+                        }
                     }
                 }
             }
@@ -468,6 +481,9 @@ async fn run_scheduled_loop(
 
             if calls.is_empty() {
                 warn!("All oracles filtered by drift protection -- skipping cycle");
+                if let Some(tg) = &cfg.telegram {
+                    tg.all_oracles_drift_blocked();
+                }
                 break;
             }
 
@@ -478,6 +494,9 @@ async fn run_scheduled_loop(
                 Ok(s) => s,
                 Err(e) => {
                     error!(error = %e, "Invalid KEEPER_PRIVATE_KEY -- cannot send tx");
+                    if let Some(tg) = &cfg.telegram {
+                        tg.critical_invalid_key();
+                    }
                     break;
                 }
             };
@@ -511,6 +530,9 @@ async fn run_scheduled_loop(
                             num_oracles = calls.len(),
                             "batchUpdate reverted -- falling back to individual oracle updates"
                         );
+                        if let Some(tg) = &cfg.telegram {
+                            tg.batch_reverted(calls.len(), &batch_err.to_string());
+                        }
                         // Fall through to individual updates below
                     }
                 }
@@ -542,11 +564,15 @@ async fn run_scheduled_loop(
                     }
                 } else {
                     failed += 1;
+                    let err_str = r.error.as_deref().unwrap_or("unknown");
                     warn!(
                         oracle = %r.oracle,
-                        error = r.error.as_deref().unwrap_or("unknown"),
+                        error = err_str,
                         "individual update failed"
                     );
+                    if let Some(tg) = &cfg.telegram {
+                        tg.individual_update_failed(&format!("{:#x}", r.oracle), err_str);
+                    }
                 }
             }
 
@@ -571,6 +597,9 @@ async fn run_scheduled_loop(
                         attempts = attempt,
                         "CRITICAL: all oracle updates failed (batch + individual) after max retries -- giving up this cycle"
                     );
+                    if let Some(tg) = &cfg.telegram {
+                        tg.critical_all_updates_failed(attempt);
+                    }
                     break;
                 } else {
                     warn!(
@@ -579,6 +608,9 @@ async fn run_scheduled_loop(
                         retry_delay_secs = cfg.hub.retry_delay_secs,
                         "all individual updates failed -- will retry full cycle"
                     );
+                    if let Some(tg) = &cfg.telegram {
+                        tg.retrying_cycle(attempt, cfg.hub.max_retries, cfg.hub.retry_delay_secs);
+                    }
                     sleep(Duration::from_secs(cfg.hub.retry_delay_secs)).await;
                     continue;
                 }
