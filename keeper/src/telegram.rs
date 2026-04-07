@@ -79,6 +79,18 @@ impl TelegramNotifier {
 
     // ── Alert helpers ────────────────────────────────────────────────────────
 
+    pub fn startup_discrepancy(&self, spoke: &str, stored: u128, current: u128, delta_bps: u64) {
+        self.send(format!(
+            "⚠️ <b>Startup: oracle vs spoke discrepancy</b>\n\
+             Spoke: <code>{spoke}</code>\n\
+             On-chain stored: <code>{stored}</code>\n\
+             Current spoke:   <code>{current}</code>\n\
+             Delta: <b>{delta_bps} bps</b>\n\
+             Keeper was likely down during a bridge or yield event. \
+             Pushing current value — circuit breaker will trip if delta is too large."
+        ));
+    }
+
     pub fn drift_alert(&self, spoke: &str, oracle: &str, max_bps: u64) {
         if !self.check_cooldown(&format!("drift:{spoke}")) { return; }
         self.send(format!(

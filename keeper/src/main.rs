@@ -108,6 +108,54 @@ async fn main() -> Result<()> {
         ));
     }
 
+    // Startup discrepancy check: compare storedTotalAssets on-chain vs current spoke value.
+    // Alerts if the keeper was down during a bridge or significant yield event.
+    // Does NOT block the push — circuit breaker handles that.
+    {
+        const STARTUP_WARN_BPS: u64 = 100; // warn if >1% difference
+        let spoke_values = spoke::read_all_spokes(&active_spokes).await;
+        for spoke in &active_spokes {
+            let oracle_addr = match &spoke.oracle_address {
+                Some(a) => a.clone(),
+                None => continue,
+            };
+            let current = match spoke_values.iter().find(|(n, _)| n == &spoke.name) {
+                Some((_, v)) if *v > 1 => *v,
+                _ => continue, // spoke unreadable or empty vault — skip
+            };
+            match oracle::stored_total_assets(&oracle_addr, cfg.flow_rpc()).await {
+                Ok(stored_u256) => {
+                    let stored: u128 = stored_u256.try_into().unwrap_or(0);
+                    if stored <= 1 {
+                        continue; // oracle never pushed yet — normal at launch
+                    }
+                    let delta_bps = if current > stored {
+                        ((current - stored) as u128 * 10_000 / stored as u128) as u64
+                    } else {
+                        ((stored - current) as u128 * 10_000 / stored as u128) as u64
+                    };
+                    if delta_bps > STARTUP_WARN_BPS {
+                        warn!(
+                            spoke = %spoke.name,
+                            stored,
+                            current,
+                            delta_bps,
+                            "startup: oracle vs spoke discrepancy detected"
+                        );
+                        if let Some(tg) = &cfg.telegram {
+                            tg.startup_discrepancy(&spoke.name, stored, current, delta_bps);
+                        }
+                    } else {
+                        info!(spoke = %spoke.name, stored, current, delta_bps, "startup: oracle in sync");
+                    }
+                }
+                Err(e) => {
+                    warn!(spoke = %spoke.name, error = %e, "startup: could not read storedTotalAssets");
+                }
+            }
+        }
+    }
+
     // Shared state between HTTP API and main loop
     let shared_state: SharedState = Arc::new(tokio::sync::RwLock::new(KeeperState {
         update_interval_secs: cfg.hub.update_interval_secs,
@@ -316,7 +364,10 @@ async fn run_monitor_loop(
                 Ok(s) => s,
                 Err(e) => {
                     error!(error = %e, "monitor: invalid KEEPER_PRIVATE_KEY");
-                    break;
+                    if let Some(tg) = &cfg.telegram {
+                        tg.critical_invalid_key();
+                    }
+                    continue; // don't break — other spokes may still push fine
                 }
             };
 
@@ -470,7 +521,12 @@ async fn run_scheduled_loop(
                         skipped_drift += 1;
                         let spoke_name = spokes
                             .iter()
-                            .find(|s| s.oracle_address.as_deref().map(|a| a.to_lowercase()) == Some(oracle_str.to_lowercase()))
+                            .find(|s| {
+                                s.oracle_address.as_deref()
+                                    .and_then(|a| Address::from_str(a).ok())
+                                    .map(|a| a == *oracle_addr)
+                                    .unwrap_or(false)
+                            })
                             .map(|s| s.name.as_str())
                             .unwrap_or("unknown");
                         warn!(
