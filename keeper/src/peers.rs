@@ -408,7 +408,7 @@ pub async fn cross_validate_and_resolve(
     our_readings: &[(String, u128)],
     peer_registry: &PeerRegistry,
     cfg: &RuntimeConfig,
-) -> Vec<(String, u128)> {
+) -> Vec<(String, u128)>  {
     const DIVERGENCE_THRESHOLD_BPS: u64 = 100;
 
     // Build signer from config for peer requests
@@ -466,6 +466,14 @@ pub async fn cross_validate_and_resolve(
             continue;
         }
 
+        // Both keepers failed to read this spoke
+        if our_failed && peer_vals.is_empty() {
+            warn!(spoke = %name, "both keepers failed to read spoke — no reliable value");
+            if let Some(tg) = &cfg.telegram {
+                tg.both_keepers_failed(name);
+            }
+        }
+
         if !our_failed {
             for &pv in &peer_vals {
                 let divergence = calculate_bps(*our_value, pv);
@@ -478,6 +486,9 @@ pub async fn cross_validate_and_resolve(
                         "spoke value divergence with peer exceeds {} bps",
                         DIVERGENCE_THRESHOLD_BPS
                     );
+                    if let Some(tg) = &cfg.telegram {
+                        tg.peer_divergence(name, *our_value, pv, divergence);
+                    }
                 }
             }
         }

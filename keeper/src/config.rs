@@ -54,6 +54,11 @@ pub struct HubConfig {
     /// (default 1500 = 15%). If exceeded, the oracle update is skipped.
     #[serde(default = "default_max_cumulative_drift_bps")]
     pub max_cumulative_drift_bps: u64,
+    /// Age in seconds at which the keeper warns that the oracle is approaching
+    /// the vault's staleness threshold while drift is blocking pushes.
+    /// Default: 14400 (4h) — gives a 2h window before the typical 6h vault threshold.
+    #[serde(default = "default_staleness_warn_secs")]
+    pub staleness_warn_secs: u64,
     /// This keeper's own public URL (announced to peers during registration).
     /// Example: KEEPER_URL=https://keeper1.example.com:8080
     #[serde(default)]
@@ -82,6 +87,10 @@ fn default_drift_window_secs() -> u64 {
 
 fn default_max_cumulative_drift_bps() -> u64 {
     1500 // 15%
+}
+
+fn default_staleness_warn_secs() -> u64 {
+    14400 // 4h — warn before the typical 6h vault staleness threshold
 }
 
 #[derive(Debug, Deserialize, Clone)]

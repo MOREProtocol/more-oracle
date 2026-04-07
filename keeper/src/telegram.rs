@@ -122,6 +122,27 @@ impl TelegramNotifier {
         ));
     }
 
+    pub fn peer_divergence(&self, spoke: &str, our_value: u128, peer_value: u128, divergence_bps: u64) {
+        self.send(format!(
+            "⚠️ <b>Keeper divergence — spoke value mismatch</b>\n\
+             Spoke: <code>{spoke}</code>\n\
+             This keeper: <code>{our_value}</code>\n\
+             Peer keeper: <code>{peer_value}</code>\n\
+             Divergence: <b>{divergence_bps} bps</b>\n\
+             May indicate a curator bridge, RPC lag, or stale peer. \
+             Both keepers will push their own value — monitor which lands on-chain."
+        ));
+    }
+
+    pub fn both_keepers_failed(&self, spoke: &str) {
+        self.send(format!(
+            "🔴 <b>Both keepers failed to read spoke</b>\n\
+             Spoke: <code>{spoke}</code>\n\
+             Neither this keeper nor its peer could read <code>totalAssets()</code> from the RPC.\n\
+             ⚠️ Oracle will not be updated for this spoke. Check RPC endpoints on both keepers."
+        ));
+    }
+
     pub fn retrying_cycle(&self, attempt: u32, max_retries: u32, delay_secs: u64) {
         self.send(format!(
             "⚠️ <b>Retry — attempt {attempt}/{max_retries}</b>\n\
