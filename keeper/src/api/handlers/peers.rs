@@ -70,6 +70,10 @@ pub async fn get_peer_challenge(
 
     if !whitelisted {
         tracing::warn!(wallet = %wallet, "GET /peers/challenge: wallet not whitelisted");
+        if let Some(tg) = &app.13 {
+            let peer_url = app.8.as_deref().unwrap_or("unknown");
+            tg.peer_auth_failed(peer_url, &format!("{wallet:#x}"));
+        }
         return Err((
             StatusCode::FORBIDDEN,
             Json(UpdateResponse {
@@ -170,6 +174,9 @@ pub async fn peer_register(
         peer_wallet = %wallet,
         "peer registered successfully"
     );
+    if let Some(tg) = &app.13 {
+        tg.peer_registered(&body.url, &format!("{wallet:#x}"));
+    }
 
     {
         let registry = app.4.lock().await;

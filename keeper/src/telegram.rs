@@ -79,6 +79,33 @@ impl TelegramNotifier {
 
     // ── Alert helpers ────────────────────────────────────────────────────────
 
+    pub fn peer_registered(&self, peer_url: &str, peer_wallet: &str) {
+        self.send(format!(
+            "🤝 <b>New peer keeper registered</b>\n\
+             URL: <code>{peer_url}</code>\n\
+             Wallet: <code>{peer_wallet}</code>"
+        ));
+    }
+
+    pub fn peer_evicted(&self, peer_url: &str) {
+        if !self.check_cooldown(&format!("evicted:{peer_url}")) { return; }
+        self.send(format!(
+            "⚠️ <b>Peer keeper evicted — no response for 6h</b>\n\
+             URL: <code>{peer_url}</code>\n\
+             This keeper is now running solo. Redundancy is reduced."
+        ));
+    }
+
+    pub fn peer_auth_failed(&self, peer_url: &str, wallet: &str) {
+        if !self.check_cooldown(&format!("auth_fail:{wallet}")) { return; }
+        self.send(format!(
+            "⚠️ <b>Peer auth failure</b>\n\
+             URL: <code>{peer_url}</code>\n\
+             Wallet: <code>{wallet}</code>\n\
+             Repeated failures may indicate an unauthorized keeper attempting access."
+        ));
+    }
+
     pub fn startup_discrepancy(&self, spoke: &str, stored: u128, current: u128, delta_bps: u64) {
         self.send(format!(
             "⚠️ <b>Startup: oracle vs spoke discrepancy</b>\n\

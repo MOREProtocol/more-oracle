@@ -591,10 +591,10 @@ pub async fn run_peer_sync_loop(
                 };
                 if stale && info.active {
                     info.active = false;
-                    warn!(
-                        peer_url = %url,
-                        "peer marked inactive — no response for 6h"
-                    );
+                    warn!(peer_url = %url, "peer marked inactive — no response for 6h");
+                    if let Some(tg) = &cfg.telegram {
+                        tg.peer_evicted(url);
+                    }
                 }
             }
             registry.retain(|_, v| v.active);

@@ -193,6 +193,7 @@ async fn main() -> Result<()> {
         cfg.hub.keeper_url.clone(),
         Some(signer.clone()),
         active_spokes.clone(),
+        cfg.telegram.clone(),
     ));
 
     // Peer-aware startup coordination: find the optimal position in the push schedule

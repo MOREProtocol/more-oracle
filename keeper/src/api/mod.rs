@@ -24,6 +24,7 @@ use tower_http::{limit::RequestBodyLimitLayer, timeout::TimeoutLayer};
 use crate::config::SpokeConfig;
 use crate::peer_registry::{PeerRegistry, PendingRegistrations};
 use crate::security::WhitelistCache;
+use crate::telegram::TelegramNotifier;
 
 #[derive(Debug, Default)]
 pub struct KeeperState {
@@ -82,6 +83,7 @@ pub type AppState = (
     Vec<SpokeConfig>,
     WalletChallengeStore,
     WhitelistCache,
+    Option<TelegramNotifier>, // index 13
 );
 
 pub(crate) const CHALLENGE_TTL_SECS: u64 = 300;
@@ -131,6 +133,7 @@ pub async fn start_server(
     keeper_url: Option<String>,
     signer: Option<alloy::signers::local::PrivateKeySigner>,
     spokes: Vec<SpokeConfig>,
+    telegram: Option<TelegramNotifier>,
 ) {
     let challenges: ChallengeStore = Arc::new(Mutex::new(HashMap::new()));
     let wallet_challenges: WalletChallengeStore = Arc::new(Mutex::new(HashMap::new()));
@@ -150,6 +153,7 @@ pub async fn start_server(
         spokes,
         wallet_challenges,
         whitelist_cache,
+        telegram,
     );
 
     let app = Router::new()
