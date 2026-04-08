@@ -41,6 +41,7 @@ fn build_test_app() -> Router {
         spokes,
         wallet_challenges,
         whitelist_cache,
+        None,
     );
 
     Router::new()
@@ -95,6 +96,7 @@ fn build_test_app_with_challenge(wallet: Address, challenge: &str) -> Router {
         spokes,
         wallet_challenges,
         whitelist_cache,
+        None,
     );
 
     Router::new()
@@ -156,6 +158,7 @@ fn build_test_app_with_peer(wallet: Address) -> Router {
         spokes,
         wallet_challenges,
         whitelist_cache,
+        None,
     );
 
     Router::new()
@@ -449,6 +452,7 @@ async fn test_security_headers_on_health() {
         vec![],
         wallet_challenges,
         whitelist_cache,
+        None,
     );
 
     let app = Router::new()

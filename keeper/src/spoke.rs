@@ -51,10 +51,10 @@ pub async fn read_total_assets(spoke: &SpokeConfig) -> Result<U256> {
 
 /// Read `totalAssets()` from all spokes in parallel.
 ///
-/// Returns a Vec of (spoke_name, total_assets_u128) pairs. For any spoke where
-/// the read fails or returns zero, the value `1` is used (avoids ValueNotPositive
-/// revert on the oracle).
-pub async fn read_all_spokes(spokes: &[SpokeConfig]) -> Vec<(String, u128)> {
+/// Returns a Vec of `(spoke_name, value, rpc_failed)` triples:
+/// - `rpc_failed = false`: RPC call succeeded (value may be 1 if vault is empty)
+/// - `rpc_failed = true`: RPC call failed; value is 1 (safe fallback for push)
+pub async fn read_all_spokes(spokes: &[SpokeConfig]) -> Vec<(String, u128, bool)> {
     let futures: Vec<_> = spokes
         .iter()
         .map(|spoke| {
@@ -78,7 +78,7 @@ pub async fn read_all_spokes(spokes: &[SpokeConfig]) -> Vec<(String, u128)> {
                                 val.to::<u128>()
                             }
                         };
-                        (name, as_u128)
+                        (name, as_u128, false)
                     }
                     Err(err) => {
                         tracing::warn!(
@@ -86,7 +86,7 @@ pub async fn read_all_spokes(spokes: &[SpokeConfig]) -> Vec<(String, u128)> {
                             error = %err,
                             "failed to read totalAssets() — using 1"
                         );
-                        (name, 1u128)
+                        (name, 1u128, true)
                     }
                 }
             }

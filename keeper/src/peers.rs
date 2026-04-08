@@ -405,7 +405,7 @@ pub async fn query_peer_spoke_values(
 
 /// Cross-validate our readings against peer readings and resolve fallbacks.
 pub async fn cross_validate_and_resolve(
-    our_readings: &[(String, u128)],
+    our_readings: &[(String, u128, bool)],
     peer_registry: &PeerRegistry,
     cfg: &RuntimeConfig,
 ) -> Vec<(String, u128)>  {
@@ -416,7 +416,7 @@ pub async fn cross_validate_and_resolve(
         Ok(s) => s,
         Err(e) => {
             warn!(error = %e, "cross_validate: invalid KEEPER_PRIVATE_KEY, skipping peer queries");
-            return our_readings.to_vec();
+            return our_readings.iter().map(|(n, v, _)| (n.clone(), *v)).collect();
         }
     };
     let signer: PrivateKeySigner = signer;
@@ -446,9 +446,10 @@ pub async fn cross_validate_and_resolve(
 
     let mut resolved: Vec<(String, u128)> = Vec::with_capacity(our_readings.len());
 
-    for (name, our_value) in our_readings {
-        let our_failed = *our_value <= 1;
+    for (name, our_value, rpc_failed) in our_readings {
+        let our_failed = *rpc_failed;
 
+        // Peer values with real assets (source "rpc" or "peer_fallback", value > 1)
         let peer_vals: Vec<u128> = peer_values
             .iter()
             .flat_map(|readings: &Vec<SpokeReading>| {
@@ -466,8 +467,12 @@ pub async fn cross_validate_and_resolve(
             continue;
         }
 
-        // Both keepers failed to read this spoke — only alert if peers exist
-        if our_failed && peer_vals.is_empty() && !peer_urls.is_empty() {
+        // Alert only when both keepers had a real RPC failure — not when the vault
+        // is simply empty (peer source "empty" means the peer read 0 successfully).
+        let peer_confirmed_empty = peer_values.iter().any(|readings| {
+            readings.iter().any(|r| r.spoke == *name && r.source == "empty")
+        });
+        if our_failed && peer_vals.is_empty() && !peer_urls.is_empty() && !peer_confirmed_empty {
             warn!(spoke = %name, "both keepers failed to read spoke — no reliable value");
             if let Some(tg) = &cfg.telegram {
                 tg.both_keepers_failed(name);

@@ -119,8 +119,8 @@ async fn main() -> Result<()> {
                 Some(a) => a.clone(),
                 None => continue,
             };
-            let current = match spoke_values.iter().find(|(n, _)| n == &spoke.name) {
-                Some((_, v)) if *v > 1 => *v,
+            let current = match spoke_values.iter().find(|(n, _, _)| n == &spoke.name) {
+                Some((_, v, _)) if *v > 1 => *v,
                 _ => continue, // spoke unreadable or empty vault — skip
             };
             match oracle::stored_total_assets(&oracle_addr, cfg.flow_rpc()).await {
@@ -295,7 +295,7 @@ async fn run_monitor_loop(
         info!("monitor: reading totalAssets from {} spoke(s)", spokes.len());
         let spoke_values = spoke::read_all_spokes(spokes).await;
 
-        for (name, total_assets) in &spoke_values {
+        for (name, total_assets, _) in &spoke_values {
             let spoke_cfg = match spokes.iter().find(|s| &s.name == name) {
                 Some(s) => s,
                 None => continue,
@@ -430,7 +430,7 @@ async fn run_scheduled_loop(
             info!("Reading totalAssets from {} spoke(s)...", spokes.len());
             let spoke_values = spoke::read_all_spokes(spokes).await;
 
-            for (name, val) in &spoke_values {
+            for (name, val, _) in &spoke_values {
                 info!(spoke = %name, total_assets = val, "read spoke value");
             }
 
@@ -446,9 +446,15 @@ async fn run_scheduled_loop(
                     .map(|(name, value)| {
                         let source = if spoke_values
                             .iter()
-                            .any(|(n, v)| n == name && *v == *value && *v > 1)
+                            .any(|(n, v, failed)| n == name && *v == *value && *v > 1 && !failed)
                         {
                             "rpc".to_string()
+                        } else if spoke_values
+                            .iter()
+                            .any(|(n, _, failed)| n == name && !failed)
+                            && *value <= 1
+                        {
+                            "empty".to_string()
                         } else if *value > 1 {
                             "peer_fallback".to_string()
                         } else {

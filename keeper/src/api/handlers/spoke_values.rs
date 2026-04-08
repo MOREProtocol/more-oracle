@@ -83,8 +83,14 @@ pub async fn peer_spoke_values_live(
 
     let readings = raw
         .into_iter()
-        .map(|(name, value)| {
-            let source = if value == 1 { "failed" } else { "rpc" };
+        .map(|(name, value, rpc_failed)| {
+            let source = if rpc_failed {
+                "failed"
+            } else if value <= 1 {
+                "empty"
+            } else {
+                "rpc"
+            };
             LiveSpokeReading {
                 spoke: name,
                 value: value.to_string(),
