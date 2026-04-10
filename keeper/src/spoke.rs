@@ -55,40 +55,50 @@ pub async fn read_total_assets(spoke: &SpokeConfig) -> Result<U256> {
 /// - `rpc_failed = false`: RPC call succeeded (value may be 1 if vault is empty)
 /// - `rpc_failed = true`: RPC call failed; value is 1 (safe fallback for push)
 pub async fn read_all_spokes(spokes: &[SpokeConfig]) -> Vec<(String, u128, bool)> {
+    const MAX_ATTEMPTS: u32 = 3;
+    const RETRY_DELAY_MS: u64 = 3_000;
+
     let futures: Vec<_> = spokes
         .iter()
         .map(|spoke| {
             let spoke = spoke.clone();
             async move {
                 let name = spoke.name.clone();
-                match read_total_assets(&spoke).await {
-                    Ok(val) => {
-                        let as_u128 = if val == U256::ZERO {
-                            tracing::warn!(
-                                spoke = %name,
-                                "totalAssets() returned 0 — using 1 to avoid ValueNotPositive revert"
-                            );
-                            1u128
-                        } else {
-                            // Clamp to u128::MAX if the value overflows
-                            let max = U256::from(u128::MAX);
-                            if val > max {
-                                u128::MAX
+                let mut last_err = String::new();
+                for attempt in 1..=MAX_ATTEMPTS {
+                    match read_total_assets(&spoke).await {
+                        Ok(val) => {
+                            let as_u128 = if val == U256::ZERO {
+                                tracing::warn!(
+                                    spoke = %name,
+                                    "totalAssets() returned 0 — using 1 to avoid ValueNotPositive revert"
+                                );
+                                1u128
                             } else {
-                                val.to::<u128>()
+                                let max = U256::from(u128::MAX);
+                                if val > max { u128::MAX } else { val.to::<u128>() }
+                            };
+                            return (name, as_u128, false);
+                        }
+                        Err(err) => {
+                            last_err = err.to_string();
+                            if attempt < MAX_ATTEMPTS {
+                                tracing::warn!(
+                                    spoke = %name,
+                                    attempt,
+                                    "totalAssets() failed, retrying in {RETRY_DELAY_MS}ms"
+                                );
+                                tokio::time::sleep(tokio::time::Duration::from_millis(RETRY_DELAY_MS)).await;
                             }
-                        };
-                        (name, as_u128, false)
-                    }
-                    Err(err) => {
-                        tracing::warn!(
-                            spoke = %name,
-                            error = %err,
-                            "failed to read totalAssets() — using 1"
-                        );
-                        (name, 1u128, true)
+                        }
                     }
                 }
+                tracing::warn!(
+                    spoke = %name,
+                    error = %last_err,
+                    "failed to read totalAssets() after {MAX_ATTEMPTS} attempts — using 1"
+                );
+                (name, 1u128, true)
             }
         })
         .collect();
