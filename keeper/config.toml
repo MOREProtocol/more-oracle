@@ -55,7 +55,7 @@ active = true
 name = "ethereum"
 eid = 30101
 chain_id = 1
-rpc_url = "https://eth.llamarpc.com"
+rpc_url = "https://ethereum.publicnode.com"
 vault_address = "0xaf46A54208CE9924B7577AFf146dfD65eB193861"
 active = true
 
@@ -86,7 +86,7 @@ active = true
 [[spokes]]
 name = "plasma"
 eid = 30383
-chain_id = 999
-rpc_url = "https://rpc.plasma.finance"
+chain_id = 9745
+rpc_url = "https://plasma.drpc.org"
 vault_address = "0xaf46A54208CE9924B7577AFf146dfD65eB193861"
 active = true
