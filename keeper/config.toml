@@ -28,15 +28,18 @@ api_port = 8080
 # Cumulative drift protection (off-chain safety check)
 # Window duration in seconds — the keeper tracks value changes within this period.
 # Set to 0 to disable. Recommended: 86400 (24h) once vault is stable.
-drift_window_secs = 0
+drift_window_secs = 86400
 # Maximum cumulative drift from the anchor value in basis points.
-# Set to 0 to disable. Recommended: 1500 (15%) once vault is stable.
-max_cumulative_drift_bps = 0
+# 50 bps (0.50%) daily — allows normal yield and curator bridges while
+# catching sustained manipulation. Raise before large bridge events.
+max_cumulative_drift_bps = 50
+
+keeper_url = "https://k4mn7x2p.alphayields.ai"
 
 # Peer keeper URLs (optional) — used at startup to find optimal push position
 # Add as many peers as needed
 peers = [
-  # "http://keeper2.example.com:8080",
+  "https://r9wq3b5j.alphayields.ai",
 ]
 
 [[spokes]]
