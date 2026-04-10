@@ -18,6 +18,9 @@ const COOLDOWN_SECS: u64 = 3600; // 1 hour
 pub struct TelegramNotifier {
     token: String,
     chat_id: String,
+    /// Human-readable keeper name shown as prefix in every alert (e.g. "more").
+    /// Read from KEEPER_NAME env var; defaults to "keeper".
+    name: String,
     client: reqwest::Client,
     /// last-sent timestamps keyed by alert type + spoke/oracle identifier
     cooldown: Arc<Mutex<HashMap<String, u64>>>,
@@ -31,9 +34,12 @@ impl TelegramNotifier {
         if token.is_empty() || chat_id.is_empty() {
             return None;
         }
+        let name = std::env::var("KEEPER_NAME")
+            .unwrap_or_else(|_| "keeper".to_string());
         Some(Self {
             token,
             chat_id,
+            name,
             client: reqwest::Client::new(),
             cooldown: Arc::new(Mutex::new(HashMap::new())),
         })
@@ -56,6 +62,7 @@ impl TelegramNotifier {
     pub fn send(&self, text: String) {
         let url = format!("{}/bot{}/sendMessage", TELEGRAM_API, self.token);
         let chat_id = self.chat_id.clone();
+        let text = format!("[{}] {}", self.name, text);
         let client = self.client.clone();
         tokio::spawn(async move {
             let payload = serde_json::json!({
