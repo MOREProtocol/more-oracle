@@ -86,6 +86,14 @@ impl TelegramNotifier {
 
     // ── Alert helpers ────────────────────────────────────────────────────────
 
+    pub fn peer_connected(&self, peer_url: &str) {
+        self.send(format!(
+            "🔗 <b>Connected to peer keeper</b>\n\
+             URL: <code>{peer_url}</code>\n\
+             This keeper registered successfully with its peer on startup."
+        ));
+    }
+
     pub fn peer_registered(&self, peer_url: &str, peer_wallet: &str) {
         self.send(format!(
             "🤝 <b>New peer keeper registered</b>\n\

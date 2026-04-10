@@ -334,6 +334,9 @@ pub async fn attempt_peer_registrations(
                         active: true,
                     });
                 info!(peer_url = %peer_url, "peer registration succeeded");
+                if let Some(tg) = &cfg.telegram {
+                    tg.peer_connected(peer_url);
+                }
             }
             Err(e) => {
                 warn!(peer_url = %peer_url, error = %e, "peer registration failed");

@@ -206,6 +206,9 @@ async fn main() -> Result<()> {
     )
     .await;
 
+    // Register with peers before sleeping so both keepers are connected from the start
+    peers::attempt_peer_registrations(&cfg, &signer, &peer_registry).await;
+
     if startup_sleep.as_secs() > 0 {
         info!(
             sleep_secs = startup_sleep.as_secs(),
@@ -213,9 +216,6 @@ async fn main() -> Result<()> {
         );
         sleep(startup_sleep).await;
     }
-
-    // Attempt peer registrations after startup sleep
-    peers::attempt_peer_registrations(&cfg, &signer, &peer_registry).await;
 
     // Shared last-pushed state: tracks per-spoke what was last pushed and when.
     let last_pushed: LastPushedState = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
