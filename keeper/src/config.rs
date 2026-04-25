@@ -113,6 +113,10 @@ pub struct RuntimeConfig {
     pub hub: HubConfig,
     pub spokes: Vec<SpokeConfig>,
     pub keeper_private_key: String,
+    /// Optional: private key of the oracle owner wallet.
+    /// Set ORACLE_OWNER_PRIVATE_KEY in .env to enable setMaxChangeBps() calls
+    /// during bridge warning events. Only one keeper needs this key.
+    pub oracle_owner_private_key: Option<String>,
     /// Optional RPC overrides from env (RPC_FLOW, RPC_ARBITRUM, …)
     pub rpc_overrides: HashMap<String, String>,
     /// Telegram notifier — None if TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID not set
@@ -159,6 +163,15 @@ impl RuntimeConfig {
             }
         }
 
+        let oracle_owner_private_key = std::env::var("ORACLE_OWNER_PRIVATE_KEY")
+            .ok()
+            .filter(|k| !k.is_empty());
+        if oracle_owner_private_key.is_some() {
+            tracing::info!("oracle owner key: loaded — setMaxChangeBps() enabled for bridge warnings");
+        } else {
+            tracing::info!("oracle owner key: ORACLE_OWNER_PRIVATE_KEY not set — bridge warnings will bypass drift only");
+        }
+
         let telegram = crate::telegram::TelegramNotifier::from_env();
         if telegram.is_some() {
             tracing::info!("telegram: notifications enabled");
@@ -170,6 +183,7 @@ impl RuntimeConfig {
             hub: cfg.hub,
             spokes: cfg.spokes,
             keeper_private_key,
+            oracle_owner_private_key,
             rpc_overrides,
             telegram,
         })

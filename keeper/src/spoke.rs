@@ -53,7 +53,7 @@ pub async fn read_total_assets(spoke: &SpokeConfig) -> Result<U256> {
 ///
 /// Returns a Vec of `(spoke_name, value, rpc_failed)` triples:
 /// - `rpc_failed = false`: RPC call succeeded (value may be 1 if vault is empty)
-/// - `rpc_failed = true`: RPC call failed; value is 1 (safe fallback for push)
+/// - `rpc_failed = true`: RPC call failed; spoke will be skipped — oracle not updated this cycle
 pub async fn read_all_spokes(spokes: &[SpokeConfig]) -> Vec<(String, u128, bool)> {
     const MAX_ATTEMPTS: u32 = 3;
     const RETRY_DELAY_MS: u64 = 3_000;
@@ -96,7 +96,7 @@ pub async fn read_all_spokes(spokes: &[SpokeConfig]) -> Vec<(String, u128, bool)
                 tracing::warn!(
                     spoke = %name,
                     error = %last_err,
-                    "failed to read totalAssets() after {MAX_ATTEMPTS} attempts — using 1"
+                    "failed to read totalAssets() after {MAX_ATTEMPTS} attempts — spoke will be skipped this cycle"
                 );
                 (name, 1u128, true)
             }

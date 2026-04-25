@@ -103,7 +103,9 @@ fn build_app_from_wallet_challenge_store(wallet_challenges: WalletChallengeStore
         vec![],
         wallet_challenges,
         whitelist_cache,
-        None,
+        None, // telegram
+        Arc::new(Mutex::new(HashMap::new())), // bridge_warnings
+        None, // oracle_owner_signer
     );
 
     make_router(app_state)
@@ -137,7 +139,9 @@ fn build_app_impl(
         vec![],
         wallet_challenges,
         whitelist_cache,
-        None,
+        None, // telegram
+        Arc::new(Mutex::new(HashMap::new())), // bridge_warnings
+        None, // oracle_owner_signer
     );
 
     make_router(app_state)
@@ -833,7 +837,9 @@ async fn test_request_body_too_large_returns_413() {
         vec![],
         wallet_challenges,
         whitelist_cache,
-        None,
+        None, // telegram
+        Arc::new(Mutex::new(HashMap::new())), // bridge_warnings
+        None, // oracle_owner_signer
     );
 
     let app = Router::new()

@@ -32,7 +32,7 @@ drift_window_secs = 86400
 # Maximum cumulative drift from the anchor value in basis points.
 # 50 bps (0.50%) daily — allows normal yield and curator bridges while
 # catching sustained manipulation. Raise before large bridge events.
-max_cumulative_drift_bps = 50
+max_cumulative_drift_bps = 0
 
 keeper_url = "https://k4mn7x2p.alphayields.ai"
 

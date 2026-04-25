@@ -108,6 +108,12 @@ impl DriftTracker {
         true
     }
 
+    /// Clear all drift history for the given oracle so the next push becomes
+    /// a fresh anchor. Called after a bridge warning completes.
+    pub fn reset(&mut self, oracle: &str) {
+        self.history.remove(&oracle.to_lowercase());
+    }
+
     /// Compute the absolute drift in basis points between two values.
     /// Returns 0 if the anchor is zero (avoids division by zero).
     fn calculate_drift_bps(anchor: u128, current: u128) -> u64 {

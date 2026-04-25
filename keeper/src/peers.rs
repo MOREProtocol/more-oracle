@@ -463,40 +463,46 @@ pub async fn cross_validate_and_resolve(
             })
             .collect();
 
-        if our_failed && !peer_vals.is_empty() {
-            let fallback_value = peer_vals[0];
-            info!(spoke = %name, peer_value = fallback_value, "RPC fallback from peer");
-            resolved.push((name.clone(), fallback_value));
+        if our_failed {
+            if !peer_vals.is_empty() {
+                // Peer has a valid reading — use it as fallback.
+                let fallback_value = peer_vals[0];
+                info!(spoke = %name, peer_value = fallback_value, "RPC fallback from peer");
+                resolved.push((name.clone(), fallback_value));
+            } else {
+                // No reliable value from any source — skip this spoke entirely.
+                // Pushing a sentinel or degraded NAV would expose the vault to arbitrage.
+                let peer_confirmed_empty = peer_values.iter().any(|readings| {
+                    readings.iter().any(|r| r.spoke == *name && r.source == "empty")
+                });
+                if !peer_urls.is_empty() && !peer_confirmed_empty {
+                    warn!(spoke = %name, "both keepers failed to read spoke — skipping oracle update");
+                    if let Some(tg) = &cfg.telegram {
+                        tg.both_keepers_failed(name);
+                    }
+                } else {
+                    warn!(spoke = %name, "spoke RPC failed with no peer fallback — skipping oracle update");
+                    if let Some(tg) = &cfg.telegram {
+                        tg.spoke_skipped_rpc_failed(name);
+                    }
+                }
+            }
             continue;
         }
 
-        // Alert only when both keepers had a real RPC failure — not when the vault
-        // is simply empty (peer source "empty" means the peer read 0 successfully).
-        let peer_confirmed_empty = peer_values.iter().any(|readings| {
-            readings.iter().any(|r| r.spoke == *name && r.source == "empty")
-        });
-        if our_failed && peer_vals.is_empty() && !peer_urls.is_empty() && !peer_confirmed_empty {
-            warn!(spoke = %name, "both keepers failed to read spoke — no reliable value");
-            if let Some(tg) = &cfg.telegram {
-                tg.both_keepers_failed(name);
-            }
-        }
-
-        if !our_failed {
-            for &pv in &peer_vals {
-                let divergence = calculate_bps(*our_value, pv);
-                if divergence > DIVERGENCE_THRESHOLD_BPS {
-                    warn!(
-                        spoke = %name,
-                        our_value = our_value,
-                        peer_value = pv,
-                        divergence_bps = divergence,
-                        "spoke value divergence with peer exceeds {} bps",
-                        DIVERGENCE_THRESHOLD_BPS
-                    );
-                    if let Some(tg) = &cfg.telegram {
-                        tg.peer_divergence(name, *our_value, pv, divergence);
-                    }
+        for &pv in &peer_vals {
+            let divergence = calculate_bps(*our_value, pv);
+            if divergence > DIVERGENCE_THRESHOLD_BPS {
+                warn!(
+                    spoke = %name,
+                    our_value = our_value,
+                    peer_value = pv,
+                    divergence_bps = divergence,
+                    "spoke value divergence with peer exceeds {} bps",
+                    DIVERGENCE_THRESHOLD_BPS
+                );
+                if let Some(tg) = &cfg.telegram {
+                    tg.peer_divergence(name, *our_value, pv, divergence);
                 }
             }
         }
@@ -627,5 +633,111 @@ pub async fn run_peer_sync_loop(
                 }
             }
         }
+    }
+}
+
+/// Propagate a bridge warning to all registered peers via POST /peers/bridge-warning.
+/// Best-effort — individual peer failures are logged but do not block the caller.
+pub async fn propagate_bridge_warning(
+    spoke_name: &str,
+    expected_delta: u128,
+    pre_bridge_value: u128,
+    timeout_at: u64,
+    original_max_change_bps: Option<u64>,
+    signer: &PrivateKeySigner,
+    batch_updater: Address,
+    flow_rpc: &str,
+    peer_registry: &PeerRegistry,
+) {
+    let peers: Vec<String> = {
+        let registry = peer_registry.lock().await;
+        registry.keys().cloned().collect()
+    };
+
+    if peers.is_empty() {
+        return;
+    }
+
+    let client = match reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            warn!(error = %e, "propagate_bridge_warning: failed to build HTTP client");
+            return;
+        }
+    };
+
+    let our_wallet = signer.address();
+
+    for peer_url in peers {
+        if validate_peer_url(&peer_url).is_err() {
+            continue;
+        }
+
+        // Fetch a fresh challenge for this peer
+        let challenge_url = format!(
+            "{}/peers/challenge?wallet={our_wallet:#x}",
+            peer_url.trim_end_matches('/')
+        );
+        let challenge = match client.get(&challenge_url).send().await {
+            Ok(resp) if resp.status().is_success() => {
+                match resp.json::<serde_json::Value>().await {
+                    Ok(j) => match j["challenge"].as_str() {
+                        Some(c) => c.to_string(),
+                        None => {
+                            warn!(peer_url = %peer_url, "propagate_bridge_warning: missing challenge field");
+                            continue;
+                        }
+                    },
+                    Err(e) => {
+                        warn!(peer_url = %peer_url, error = %e, "propagate_bridge_warning: failed to parse challenge");
+                        continue;
+                    }
+                }
+            }
+            Ok(resp) => {
+                warn!(peer_url = %peer_url, status = %resp.status(), "propagate_bridge_warning: challenge request failed");
+                continue;
+            }
+            Err(e) => {
+                warn!(peer_url = %peer_url, error = %e, "propagate_bridge_warning: could not reach peer");
+                continue;
+            }
+        };
+
+        let signature = match signer.sign_message(challenge.as_bytes()).await {
+            Ok(s) => format!("0x{}", alloy::hex::encode(s.as_bytes())),
+            Err(e) => {
+                warn!(error = %e, "propagate_bridge_warning: signing failed");
+                continue;
+            }
+        };
+
+        let warn_url = format!("{}/peers/bridge-warning", peer_url.trim_end_matches('/'));
+        let payload = serde_json::json!({
+            "auth_wallet": format!("{our_wallet:#x}"),
+            "auth_signature": signature,
+            "spoke": spoke_name,
+            "expected_delta": expected_delta.to_string(),
+            "pre_bridge_value": pre_bridge_value.to_string(),
+            "timeout_at": timeout_at,
+            "original_max_change_bps": original_max_change_bps,
+        });
+
+        match client.post(&warn_url).json(&payload).send().await {
+            Ok(resp) if resp.status().is_success() => {
+                info!(peer_url = %peer_url, spoke = %spoke_name, "bridge warning propagated to peer");
+            }
+            Ok(resp) => {
+                warn!(peer_url = %peer_url, status = %resp.status(), "bridge warning propagation rejected by peer");
+            }
+            Err(e) => {
+                warn!(peer_url = %peer_url, error = %e, "bridge warning propagation failed");
+            }
+        }
+
+        let _ = (batch_updater, flow_rpc); // suppress unused warnings
     }
 }

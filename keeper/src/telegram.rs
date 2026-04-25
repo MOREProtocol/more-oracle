@@ -229,4 +229,15 @@ impl TelegramNotifier {
              All individual updates failed. Retrying in {delay_secs}s."
         ));
     }
+
+    pub fn spoke_skipped_rpc_failed(&self, spoke: &str) {
+        if !self.check_cooldown(&format!("spoke_rpc_failed:{spoke}")) { return; }
+        self.send(format!(
+            "⚠️ <b>Spoke RPC failed — oracle update skipped</b>\n\
+             Spoke: <code>{spoke}</code>\n\
+             Could not read <code>totalAssets()</code> after 3 attempts. No peer fallback available.\n\
+             Oracle stays at its last on-chain value this cycle.\n\
+             If this persists, the vault may freeze. Recovery: <code>setOraclesCrossChainAccounting(false)</code>"
+        ));
+    }
 }

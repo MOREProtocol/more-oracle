@@ -23,6 +23,12 @@ sol! {
 
     #[allow(missing_docs)]
     function curator() external view returns (address);
+
+    #[allow(missing_docs)]
+    function setMaxChangeBps(uint256 newMaxChangeBps) external;
+
+    #[allow(missing_docs)]
+    function maxChangeBps() external view returns (uint256);
 }
 
 // OracleBatchUpdater — single tx for all oracle updates
@@ -248,6 +254,63 @@ pub async fn is_whitelisted(
         .with_context(|| format!("isWhitelisted() call failed for keeper {keeper}"))?;
 
     Ok(result._0)
+}
+
+/// Call `setMaxChangeBps(newMaxChangeBps)` on the oracle (requires oracle owner signer).
+pub async fn set_max_change_bps(
+    oracle_address: &str,
+    flow_rpc: &str,
+    signer: PrivateKeySigner,
+    new_max_change_bps: u64,
+) -> Result<TxHash> {
+    let rpc_url = flow_rpc
+        .parse::<reqwest::Url>()
+        .with_context(|| format!("Invalid Flow RPC URL: {flow_rpc}"))?;
+
+    let wallet = EthereumWallet::from(signer);
+    let provider = ProviderBuilder::new()
+        .with_recommended_fillers()
+        .wallet(wallet)
+        .on_http(rpc_url);
+
+    let oracle_addr = Address::from_str(oracle_address)
+        .with_context(|| format!("Invalid oracle address: {oracle_address}"))?;
+
+    let call = setMaxChangeBpsCall { newMaxChangeBps: U256::from(new_max_change_bps) };
+    let call_builder = alloy::contract::SolCallBuilder::new_sol(&provider, &oracle_addr, &call);
+    let pending = call_builder
+        .send()
+        .await
+        .with_context(|| format!("setMaxChangeBps() send failed on oracle {oracle_address}"))?;
+
+    let receipt = pending
+        .get_receipt()
+        .await
+        .context("Waiting for setMaxChangeBps() receipt failed")?;
+
+    Ok(receipt.transaction_hash)
+}
+
+/// Read the current `maxChangeBps` from the oracle contract.
+pub async fn get_max_change_bps(oracle_address: &str, flow_rpc: &str) -> Result<u64> {
+    let rpc_url = flow_rpc
+        .parse::<reqwest::Url>()
+        .with_context(|| format!("Invalid Flow RPC URL: {flow_rpc}"))?;
+
+    let provider = ProviderBuilder::new().on_http(rpc_url);
+
+    let oracle_addr = Address::from_str(oracle_address)
+        .with_context(|| format!("Invalid oracle address: {oracle_address}"))?;
+
+    let call = maxChangeBpsCall {};
+    let call_builder = alloy::contract::SolCallBuilder::new_sol(&provider, &oracle_addr, &call);
+    let result = call_builder
+        .call()
+        .await
+        .with_context(|| format!("maxChangeBps() call failed on oracle {oracle_address}"))?;
+
+    let val: u64 = result._0.try_into().unwrap_or(u64::MAX);
+    Ok(val)
 }
 
 /// Read the curator() address from the vault contract.

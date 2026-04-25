@@ -10,7 +10,7 @@ mod spoke;
 mod telegram;
 
 use alloy::{primitives::Address, signers::local::PrivateKeySigner};
-use api::{KeeperState, SharedState, SpokeReading, SpokeState};
+use api::{BridgeWarningStore, KeeperState, SharedState, SpokeReading, SpokeState};
 use drift::DriftTracker;
 use eyre::{Context, Result};
 use std::{
@@ -171,13 +171,32 @@ async fn main() -> Result<()> {
         .context("Failed to read curator() from vault")?;
     info!(curator = %curator, "vault curator loaded");
 
-    // Build signer for peer registration
+    // Build keeper signer for peer registration and oracle updates
     let signer = PrivateKeySigner::from_str(&cfg.keeper_private_key)
         .context("Invalid KEEPER_PRIVATE_KEY")?;
+
+    // Build optional oracle owner signer (for setMaxChangeBps during bridge warnings)
+    let oracle_owner_signer: Option<PrivateKeySigner> = match &cfg.oracle_owner_private_key {
+        Some(pk) => match PrivateKeySigner::from_str(pk) {
+            Ok(s) => {
+                info!(address = %s.address(), "oracle owner signer loaded");
+                Some(s)
+            }
+            Err(e) => {
+                warn!(error = %e, "ORACLE_OWNER_PRIVATE_KEY is set but invalid — oracle owner features disabled");
+                None
+            }
+        },
+        None => None,
+    };
 
     // Create peer registry and pending registrations
     let peer_registry: PeerRegistry = new_peer_registry();
     let pending_registrations = new_pending_registrations();
+
+    // Bridge warning store: shared between API handlers and the monitor loop
+    let bridge_warnings: BridgeWarningStore =
+        Arc::new(tokio::sync::Mutex::new(HashMap::new()));
 
     // Spawn HTTP API server
     let api_port = cfg.hub.api_port;
@@ -194,6 +213,8 @@ async fn main() -> Result<()> {
         Some(signer.clone()),
         active_spokes.clone(),
         cfg.telegram.clone(),
+        bridge_warnings.clone(),
+        oracle_owner_signer.clone(),
     ));
 
     // Peer-aware startup coordination: find the optimal position in the push schedule
@@ -244,12 +265,16 @@ async fn main() -> Result<()> {
         let monitor_cfg = cfg.clone();
         let monitor_last_pushed = last_pushed.clone();
         let monitor_drift_tracker = drift_tracker.clone();
+        let monitor_bridge_warnings = bridge_warnings.clone();
+        let monitor_oracle_owner_signer = oracle_owner_signer.clone();
         tokio::spawn(async move {
             run_monitor_loop(
                 &monitor_spokes,
                 &monitor_cfg,
                 monitor_last_pushed,
                 monitor_drift_tracker,
+                monitor_bridge_warnings,
+                monitor_oracle_owner_signer,
             )
             .await;
         });
@@ -271,6 +296,7 @@ async fn main() -> Result<()> {
         drift_tracker,
         last_pushed,
         peer_registry,
+        bridge_warnings,
     )
     .await;
 
@@ -280,11 +306,14 @@ async fn main() -> Result<()> {
 /// Monitor loop: runs every `monitor_interval_secs`, reads totalAssets from all
 /// spokes, and pushes individual oracle updates for any spoke whose value has
 /// drifted more than `early_push_threshold_bps` from its last pushed value.
+/// Also handles bridge warning completion/timeout detection.
 async fn run_monitor_loop(
     spokes: &[SpokeConfig],
     cfg: &RuntimeConfig,
     last_pushed: LastPushedState,
     drift_tracker: Arc<tokio::sync::Mutex<DriftTracker>>,
+    bridge_warnings: BridgeWarningStore,
+    oracle_owner_signer: Option<PrivateKeySigner>,
 ) {
     let interval = Duration::from_secs(cfg.hub.monitor_interval_secs);
     let threshold_bps = cfg.hub.early_push_threshold_bps;
@@ -304,6 +333,14 @@ async fn run_monitor_loop(
             let oracle_addr_str = match &spoke_cfg.oracle_address {
                 Some(a) => a.clone(),
                 None => continue,
+            };
+
+            let oracle_addr = match Address::from_str(&oracle_addr_str) {
+                Ok(a) => a,
+                Err(e) => {
+                    warn!(spoke = %name, error = %e, "monitor: invalid oracle address");
+                    continue;
+                }
             };
 
             // Check if delta exceeds threshold compared to last pushed value
@@ -335,27 +372,73 @@ async fn run_monitor_loop(
             };
 
             if !should_push {
+                // Still check bridge warning timeout even when no push is needed
+                check_bridge_warning_timeout(
+                    name,
+                    &oracle_addr_str,
+                    cfg,
+                    &bridge_warnings,
+                    &drift_tracker,
+                    &oracle_owner_signer,
+                )
+                .await;
                 continue;
             }
 
-            // Apply drift protection if enabled
-            let oracle_addr = match Address::from_str(&oracle_addr_str) {
-                Ok(a) => a,
-                Err(e) => {
-                    warn!(spoke = %name, error = %e, "monitor: invalid oracle address");
-                    continue;
-                }
+            // Check bridge warning state for this spoke
+            let now_secs = chrono::Utc::now().timestamp() as u64;
+            let oracle_key = format!("{oracle_addr:#x}");
+
+            let bridge_active = {
+                let warnings = bridge_warnings.lock().await;
+                warnings.contains_key(name.as_str())
             };
 
-            {
-                let now_secs = chrono::Utc::now().timestamp() as u64;
-                let oracle_key = format!("{oracle_addr:#x}");
+            if bridge_active {
+                // Bridge warning is active — check if it has completed or timed out
+                let (is_complete, is_timeout, original_bps) = {
+                    let warnings = bridge_warnings.lock().await;
+                    if let Some(w) = warnings.get(name.as_str()) {
+                        let delta = if *total_assets > w.pre_bridge_value {
+                            *total_assets - w.pre_bridge_value
+                        } else {
+                            w.pre_bridge_value - *total_assets
+                        };
+                        // Complete when we detect ≥90% of the expected delta
+                        let completion_threshold = w.expected_delta * 9 / 10;
+                        let completed = delta >= completion_threshold;
+                        let timed_out = now_secs > w.timeout_at;
+                        (completed, timed_out, w.original_max_change_bps)
+                    } else {
+                        (false, false, None)
+                    }
+                };
+
+                if is_complete || is_timeout {
+                    complete_bridge_warning(
+                        name,
+                        &oracle_addr_str,
+                        original_bps,
+                        is_timeout,
+                        cfg,
+                        &bridge_warnings,
+                        &drift_tracker,
+                        &oracle_owner_signer,
+                    )
+                    .await;
+                } else {
+                    info!(
+                        spoke = %name,
+                        current = total_assets,
+                        "monitor: bridge warning active — bypassing drift check for early push"
+                    );
+                }
+                // Allow push without drift check (bridge expected to move value)
+            } else {
+                // Normal drift protection
                 let mut tracker = drift_tracker.lock().await;
                 if !tracker.check_and_record(&oracle_key, *total_assets, now_secs) {
-                    warn!(
-                        spoke = %name,
-                        "monitor: skipping early push due to drift protection"
-                    );
+                    warn!(spoke = %name, "monitor: skipping early push due to drift protection");
                     continue;
                 }
             }
@@ -368,7 +451,7 @@ async fn run_monitor_loop(
                     if let Some(tg) = &cfg.telegram {
                         tg.critical_invalid_key();
                     }
-                    continue; // don't break — other spokes may still push fine
+                    continue;
                 }
             };
 
@@ -383,7 +466,6 @@ async fn run_monitor_loop(
                         total_assets = total_assets,
                         "monitor: early push succeeded"
                     );
-                    // Update last-pushed state
                     let mut state = last_pushed.lock().await;
                     state.insert(
                         name.clone(),
@@ -394,17 +476,114 @@ async fn run_monitor_loop(
                     );
                 }
                 Err(e) => {
-                    warn!(
-                        spoke = %name,
-                        error = %e,
-                        "monitor: early push failed"
-                    );
+                    warn!(spoke = %name, error = %e, "monitor: early push failed");
                     if let Some(tg) = &cfg.telegram {
                         tg.monitor_push_failed(name, &e.to_string());
                     }
                 }
             }
         }
+    }
+}
+
+/// Called when a bridge warning has completed or timed out.
+/// Clears the warning, resets the drift anchor, and restores maxChangeBps.
+async fn complete_bridge_warning(
+    spoke_name: &str,
+    oracle_addr_str: &str,
+    original_bps: Option<u64>,
+    timed_out: bool,
+    cfg: &RuntimeConfig,
+    bridge_warnings: &BridgeWarningStore,
+    drift_tracker: &Arc<tokio::sync::Mutex<DriftTracker>>,
+    oracle_owner_signer: &Option<PrivateKeySigner>,
+) {
+    {
+        let mut warnings = bridge_warnings.lock().await;
+        warnings.remove(spoke_name);
+    }
+
+    // Reset drift anchor so the new post-bridge value becomes a fresh baseline
+    {
+        let oracle_key = format!(
+            "{:#x}",
+            Address::from_str(oracle_addr_str).unwrap_or_default()
+        );
+        let mut tracker = drift_tracker.lock().await;
+        tracker.reset(&oracle_key);
+    }
+
+    // Restore circuit breaker if we had disabled it
+    if let (Some(bps), Some(owner_signer)) = (original_bps, oracle_owner_signer) {
+        match oracle::set_max_change_bps(oracle_addr_str, cfg.flow_rpc(), owner_signer.clone(), bps).await {
+            Ok(tx) => info!(
+                spoke = %spoke_name,
+                restored_bps = bps,
+                tx_hash = %tx,
+                "bridge warning: circuit breaker restored"
+            ),
+            Err(e) => warn!(
+                spoke = %spoke_name,
+                error = %e,
+                "bridge warning: failed to restore maxChangeBps"
+            ),
+        }
+    }
+
+    if timed_out {
+        warn!(spoke = %spoke_name, "bridge warning timed out — drift protection re-enabled");
+        if let Some(tg) = &cfg.telegram {
+            tg.send(format!(
+                "⚠️ <b>Bridge warning timed out</b>\n\
+                 Spoke: <code>{}</code>\n\
+                 Expected delta never detected within 6h. Drift protection re-enabled.",
+                spoke_name
+            ));
+        }
+    } else {
+        info!(spoke = %spoke_name, "bridge warning completed — drift protection re-enabled");
+        if let Some(tg) = &cfg.telegram {
+            tg.send(format!(
+                "✅ <b>Bridge completed</b>\n\
+                 Spoke: <code>{}</code>\n\
+                 Expected delta detected. Drift protection re-enabled.",
+                spoke_name
+            ));
+        }
+    }
+}
+
+/// Check if a bridge warning has timed out (called even when no push is needed).
+async fn check_bridge_warning_timeout(
+    spoke_name: &str,
+    oracle_addr_str: &str,
+    cfg: &RuntimeConfig,
+    bridge_warnings: &BridgeWarningStore,
+    drift_tracker: &Arc<tokio::sync::Mutex<DriftTracker>>,
+    oracle_owner_signer: &Option<PrivateKeySigner>,
+) {
+    let now_secs = chrono::Utc::now().timestamp() as u64;
+    let (timed_out, original_bps) = {
+        let warnings = bridge_warnings.lock().await;
+        if let Some(w) = warnings.get(spoke_name) {
+            (now_secs > w.timeout_at, w.original_max_change_bps)
+        } else {
+            return;
+        }
+    };
+
+    if timed_out {
+        complete_bridge_warning(
+            spoke_name,
+            oracle_addr_str,
+            original_bps,
+            true,
+            cfg,
+            bridge_warnings,
+            drift_tracker,
+            oracle_owner_signer,
+        )
+        .await;
     }
 }
 
@@ -418,6 +597,7 @@ async fn run_scheduled_loop(
     drift_tracker: Arc<tokio::sync::Mutex<DriftTracker>>,
     last_pushed: LastPushedState,
     peer_registry: PeerRegistry,
+    bridge_warnings: BridgeWarningStore,
 ) {
     loop {
         log_cycle_start("scheduled");
@@ -513,29 +693,44 @@ async fn run_scheduled_loop(
                 break;
             }
 
-            // 4. Apply cumulative drift protection
+            // 4. Apply cumulative drift protection (bypass for bridge-warned spokes)
             let now_secs = chrono::Utc::now().timestamp() as u64;
             let mut calls: Vec<(Address, u128)> = Vec::with_capacity(calls_to_push.len());
             let mut skipped_drift: usize = 0;
 
             {
                 let mut tracker = drift_tracker.lock().await;
+                let warnings_snapshot = bridge_warnings.lock().await;
+
                 for (oracle_addr, total_assets) in &calls_to_push {
                     let oracle_str = format!("{oracle_addr:#x}");
+
+                    // Find spoke name for this oracle
+                    let spoke_name = spokes
+                        .iter()
+                        .find(|s| {
+                            s.oracle_address.as_deref()
+                                .and_then(|a| Address::from_str(a).ok())
+                                .map(|a| a == *oracle_addr)
+                                .unwrap_or(false)
+                        })
+                        .map(|s| s.name.as_str())
+                        .unwrap_or("unknown");
+
+                    // If a bridge warning is active for this spoke, bypass drift
+                    if warnings_snapshot.contains_key(spoke_name) {
+                        info!(
+                            spoke = %spoke_name,
+                            "scheduled: bridge warning active — bypassing drift check"
+                        );
+                        calls.push((*oracle_addr, *total_assets));
+                        continue;
+                    }
+
                     if tracker.check_and_record(&oracle_str, *total_assets, now_secs) {
                         calls.push((*oracle_addr, *total_assets));
                     } else {
                         skipped_drift += 1;
-                        let spoke_name = spokes
-                            .iter()
-                            .find(|s| {
-                                s.oracle_address.as_deref()
-                                    .and_then(|a| Address::from_str(a).ok())
-                                    .map(|a| a == *oracle_addr)
-                                    .unwrap_or(false)
-                            })
-                            .map(|s| s.name.as_str())
-                            .unwrap_or("unknown");
                         warn!(
                             oracle = %oracle_str,
                             spoke = %spoke_name,
@@ -958,7 +1153,7 @@ fn build_oracle_calls(
         .filter_map(|spoke| {
             let oracle_addr_str = spoke.oracle_address.as_deref()?;
             let oracle_addr = Address::from_str(oracle_addr_str).ok()?;
-            let total_assets = *value_map.get(spoke.name.as_str()).unwrap_or(&1u128);
+            let total_assets = *value_map.get(spoke.name.as_str())?;
             Some((oracle_addr, total_assets))
         })
         .collect();

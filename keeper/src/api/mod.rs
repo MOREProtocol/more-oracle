@@ -69,26 +69,48 @@ pub type ChallengeStore = Arc<Mutex<HashMap<String, u64>>>;
 /// Keyed by wallet address hex -> (challenge, expires_at). Used by all authenticated endpoints.
 pub type WalletChallengeStore = Arc<Mutex<HashMap<String, (String, u64)>>>;
 
+/// State for an active bridge warning on a specific spoke.
+/// Stored keyed by spoke name in `BridgeWarningStore`.
+#[derive(Debug, Clone)]
+pub struct BridgeWarning {
+    pub spoke_name: String,
+    /// storedTotalAssets at the time the warning was issued.
+    pub pre_bridge_value: u128,
+    /// Expected absolute token delta from the bridge (e.g. 480_000_000 USDC-raw).
+    pub expected_delta: u128,
+    /// Unix timestamp after which the warning auto-expires regardless of delta.
+    pub timeout_at: u64,
+    /// The oracle's maxChangeBps before we set it to 0. None if we didn't touch it.
+    pub original_max_change_bps: Option<u64>,
+}
+
+/// Keyed by spoke name -> active bridge warning.
+pub type BridgeWarningStore = Arc<Mutex<HashMap<String, BridgeWarning>>>;
+
 pub type AppState = (
-    SharedState,
-    Arc<Notify>,
-    Address, // curator (for POST /update)
-    ChallengeStore,
-    PeerRegistry,
-    PendingRegistrations,
-    Address, // batch_updater
-    String,  // flow_rpc URL
-    Option<String>, // this keeper's own URL
-    Option<alloy::signers::local::PrivateKeySigner>,
-    Vec<SpokeConfig>,
-    WalletChallengeStore,
-    WhitelistCache,
-    Option<TelegramNotifier>, // index 13
+    SharedState,                                     // 0
+    Arc<Notify>,                                     // 1
+    Address,                                         // 2 curator (for POST /update)
+    ChallengeStore,                                  // 3
+    PeerRegistry,                                    // 4
+    PendingRegistrations,                            // 5
+    Address,                                         // 6 batch_updater
+    String,                                          // 7 flow_rpc URL
+    Option<String>,                                  // 8 this keeper's own URL
+    Option<alloy::signers::local::PrivateKeySigner>, // 9 keeper signer
+    Vec<SpokeConfig>,                                // 10
+    WalletChallengeStore,                            // 11
+    WhitelistCache,                                  // 12
+    Option<TelegramNotifier>,                        // 13
+    BridgeWarningStore,                              // 14
+    Option<alloy::signers::local::PrivateKeySigner>, // 15 oracle owner signer (optional)
 );
 
 pub(crate) const CHALLENGE_TTL_SECS: u64 = 300;
 pub(crate) const PEER_CHALLENGE_TTL_SECS: u64 = 60;
 pub(crate) const WALLET_CHALLENGE_TTL_SECS: u64 = 120;
+/// Bridge warnings auto-expire after 6 hours if the expected delta is never detected.
+pub(crate) const BRIDGE_WARNING_TIMEOUT_SECS: u64 = 21_600;
 
 /// Axum middleware that adds security headers to every response.
 async fn security_headers(request: Request<Body>, next: Next) -> Response {
@@ -134,6 +156,8 @@ pub async fn start_server(
     signer: Option<alloy::signers::local::PrivateKeySigner>,
     spokes: Vec<SpokeConfig>,
     telegram: Option<TelegramNotifier>,
+    bridge_warnings: BridgeWarningStore,
+    oracle_owner_signer: Option<alloy::signers::local::PrivateKeySigner>,
 ) {
     let challenges: ChallengeStore = Arc::new(Mutex::new(HashMap::new()));
     let wallet_challenges: WalletChallengeStore = Arc::new(Mutex::new(HashMap::new()));
@@ -154,6 +178,8 @@ pub async fn start_server(
         wallet_challenges,
         whitelist_cache,
         telegram,
+        bridge_warnings,
+        oracle_owner_signer,
     );
 
     let app = Router::new()
@@ -167,6 +193,9 @@ pub async fn start_server(
         .route("/peers/spoke-values", post(handlers::peer_spoke_values))
         .route("/peers/spoke-values/live", post(handlers::peer_spoke_values_live))
         .route("/peers/notify", post(handlers::peer_notify))
+        .route("/curator/bridge-challenge", get(handlers::get_bridge_challenge))
+        .route("/curator/bridge-warning", post(handlers::curator_bridge_warning))
+        .route("/peers/bridge-warning", post(handlers::peer_bridge_warning))
         .with_state(app_state)
         .layer(
             ServiceBuilder::new()
