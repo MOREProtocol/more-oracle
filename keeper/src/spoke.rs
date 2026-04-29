@@ -37,10 +37,9 @@ pub async fn read_total_assets(spoke: &SpokeConfig) -> Result<U256> {
         )
     })?;
 
-    // Build call data for totalAssets() — read against finalized block to avoid reorg risk
     let call = totalAssetsCall {};
     let call_builder = alloy::contract::SolCallBuilder::new_sol(&provider, &vault_addr, &call)
-        .block(BlockId::Number(BlockNumberOrTag::Finalized));
+        .block(BlockId::Number(BlockNumberOrTag::Safe));
     let result = call_builder
         .call()
         .await
