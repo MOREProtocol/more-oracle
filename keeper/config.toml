@@ -25,13 +25,11 @@ max_retries = 3
 retry_delay_secs = 60
 api_port = 8080
 
-# Cumulative drift protection (off-chain safety check)
-# Window duration in seconds — the keeper tracks value changes within this period.
-# Set to 0 to disable. Recommended: 86400 (24h) once vault is stable.
+# Cumulative drift protection (off-chain safety check).
+# 0 disables drift protection (current default). Window and max only take effect when max > 0.
+# Set to e.g. 86400 + 1500 once stable to enable protection.
 drift_window_secs = 86400
-# Maximum cumulative drift from the anchor value in basis points.
-# 50 bps (0.50%) daily — allows normal yield and curator bridges while
-# catching sustained manipulation. Raise before large bridge events.
+# 0 disables drift protection. Set to e.g. 50 or 1500 to enable.
 max_cumulative_drift_bps = 0
 
 keeper_url = "https://k4mn7x2p.alphayields.ai"

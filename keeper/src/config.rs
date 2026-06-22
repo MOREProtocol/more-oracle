@@ -50,8 +50,8 @@ pub struct HubConfig {
     /// The keeper tracks value changes within this sliding window.
     #[serde(default = "default_drift_window_secs")]
     pub drift_window_secs: u64,
-    /// Maximum cumulative drift from the anchor value in basis points
-    /// (default 1500 = 15%). If exceeded, the oracle update is skipped.
+    /// Maximum cumulative drift from the anchor value in basis points.
+    /// 0 disables drift protection (default). Values >0 enable (e.g. 1500 = 15%).
     #[serde(default = "default_max_cumulative_drift_bps")]
     pub max_cumulative_drift_bps: u64,
     /// Age in seconds at which the keeper warns that the oracle is approaching
@@ -86,7 +86,7 @@ fn default_drift_window_secs() -> u64 {
 }
 
 fn default_max_cumulative_drift_bps() -> u64 {
-    1500 // 15%
+    0 // disabled by default (0 = no drift protection). Set e.g. 1500 to enable.
 }
 
 fn default_staleness_warn_secs() -> u64 {

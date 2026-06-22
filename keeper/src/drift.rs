@@ -49,6 +49,12 @@ impl DriftTracker {
     /// When the check passes the observation is recorded automatically.
     /// When it fails the observation is NOT recorded (the value was not pushed).
     pub fn check_and_record(&mut self, oracle: &str, new_value: u128, now_secs: u64) -> bool {
+        // 0 disables drift protection entirely (window=0 or max=0 both disable).
+        // This matches the documented semantics and config default.
+        if self.window_secs == 0 || self.max_drift_bps == 0 {
+            return true;
+        }
+
         let key = oracle.to_lowercase();
 
         // Prune observations outside the sliding window.
@@ -1124,5 +1130,28 @@ mod tests {
         tracker.check_and_record("0xoracle", 1_000_000, 0);
         let lag_push_passes = tracker.check_and_record("0xoracle", our_value, 100);
         assert!(lag_push_passes, "~150 bps lag: drift allows it, corrects naturally");
+    }
+
+    // ── Zero-value disables semantics (the fix) ─────────────────────────────
+
+    /// max_drift_bps = 0 disables protection: check_and_record always returns true
+    /// (even for extreme drift). Matches documented behavior and makes 0 safe default.
+    #[test]
+    fn test_max_drift_bps_zero_disables_protection() {
+        let mut tracker = DriftTracker::new(86400, 0);
+        assert!(tracker.check_and_record("0xabc", 1_000_000, 1000), "first always allowed");
+        // Any drift, including huge moves, must pass when disabled.
+        assert!(tracker.check_and_record("0xabc", 2_000_000, 2000), "large +drift allowed when max=0");
+        assert!(tracker.check_and_record("0xabc", 100, 3000), "large -drift allowed when max=0");
+        // Same oracle, repeated calls stay allowed.
+        assert!(tracker.check_and_record("0xabc", 999_999_999, 4000));
+    }
+
+    /// window_secs = 0 also disables (early return), regardless of max.
+    #[test]
+    fn test_window_secs_zero_disables_protection() {
+        let mut tracker = DriftTracker::new(0, 1500);
+        assert!(tracker.check_and_record("0xabc", 1_000_000, 1000));
+        assert!(tracker.check_and_record("0xabc", 9_000_000, 2000), "huge drift passes when window=0");
     }
 }

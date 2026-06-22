@@ -75,8 +75,8 @@ Logs are structured JSON (tracing). `RUST_LOG=info` is the default; set `RUST_LO
 | `max_retries` | `3` | Number of retry attempts if all updates fail in a cycle |
 | `retry_delay_secs` | `60` | Seconds to wait between retries |
 | `api_port` | `8080` | Port the HTTP API listens on |
-| `drift_window_secs` | `0` | Sliding window for cumulative drift protection, in seconds. `0` disables. Recommended `86400` (24h) once vault is stable |
-| `max_cumulative_drift_bps` | `0` | Maximum cumulative drift from the window anchor before the keeper suppresses a push. `0` disables. Recommended `1500` (15%) once vault is stable |
+| `drift_window_secs` | `86400` | Sliding window for cumulative drift protection, in seconds. Only applies when `max_cumulative_drift_bps > 0`. `0` disables window (but max=0 already disables protection). Recommended `86400` when enabling. |
+| `max_cumulative_drift_bps` | `0` | Maximum cumulative drift from the window anchor before suppressing push. `0` disables (default, safe). Set >0 (e.g. `1500`) to enable protection. Recommended `1500` (15%) once vault is stable. |
 | `keeper_url` | unset | Public URL of this keeper instance. Required for peer coordination |
 | `peers` | `[]` | URLs of other keeper instances to register with on startup |
 
